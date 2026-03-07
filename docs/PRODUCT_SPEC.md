@@ -107,10 +107,10 @@ Reference cases: Snyk, Datadog, HashiCorp (Terraform).
 - [x] Local-only mode (no API key required)
 - [x] AI mode (--ai flag)
 - [x] PyPI release (v0.1.0)
-- [ ] GitHub repo polish (README + screenshots + GIF demo)
-- [ ] Expand detection rules (S3 public access, cross-account trust, excessive resource access)
-- [ ] Output format options (--format json / --format table / --format sarif)
-- [ ] Open-source public launch
+- [x] GitHub repo polish (README + screenshots + GIF demo)
+- [x] Expand detection rules (S3 public access, cross-account trust, excessive resource access)
+- [x] Output format options (--format json / --format table / --format sarif)
+- [x] Open-source public launch
 - [ ] Product Hunt / Hacker News / Reddit launch
 - [ ] Technical blog (AWS IAM security content)
 
