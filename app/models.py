@@ -2,7 +2,7 @@
 models.py — Pydantic request/response models for the IAM Analyzer Project.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AnalyzeRequest(BaseModel):
@@ -80,3 +80,39 @@ class EscalationResult(BaseModel):
     )
     summary: str = Field(..., description="One-sentence overall risk summary.")
     status: str = Field(default="ok")
+
+
+class FixChange(BaseModel):
+    """A single transformation applied by fix_policy_local()."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: str = Field(..., description=(
+        "Change type: 'removed_action', 'scoped_wildcard', "
+        "'replaced_wildcard', or 'resource_wildcard_warning'."
+    ))
+    statement_index: int = Field(..., description="Zero-based index of the affected Statement.")
+    reason: str = Field(..., description="Human-readable explanation of the change.")
+    action: str | None = Field(default=None, description="Removed action (removed_action type).")
+    from_: str | None = Field(
+        default=None,
+        serialization_alias="from",
+        description="Original wildcard action (scoped_wildcard / replaced_wildcard types).",
+    )
+    to: list[str] | None = Field(
+        default=None,
+        description="Replacement actions (scoped_wildcard / replaced_wildcard types).",
+    )
+
+
+class FixResult(BaseModel):
+    """Response model returned by fix_policy_local()."""
+
+    original_risk_level: str = Field(..., description="Risk level of the original policy.")
+    fixed_risk_level: str = Field(..., description="Risk level of the fixed policy.")
+    fixed_policy: dict = Field(..., description="The transformed IAM policy document.")
+    changes: list[FixChange] = Field(..., description="All transformations applied.")
+    manual_review_needed: list[str] = Field(
+        ..., description="Statements that could not be auto-fixed."
+    )
+    status: str = Field(default="success")

@@ -11,7 +11,15 @@ import os
 import anthropic
 
 from app import aws_client
-from app.models import AnalysisResult, EscalationFinding, EscalationResult, ExplainResult, RuleFinding
+from app.models import (
+    AnalysisResult,
+    EscalationFinding,
+    EscalationResult,
+    ExplainResult,
+    FixChange,
+    FixResult,
+    RuleFinding,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +81,30 @@ _CONTEXT_MEDIUM: dict[str, str] = {
 # Number of structural rules (Categories 1 and 3) not captured in action sets.
 # Exported so the CLI banner can include them in the total rule count.
 STRUCTURAL_RULE_COUNT: int = 5  # R001, R002, R005, R006, R007
+
+# Minimal read-only replacements for service-level wildcards (e.g. "s3:*").
+# Used by fix_policy_local() to replace over-permissive service wildcards with
+# the smallest set of read actions that keeps the policy functional.
+SERVICE_READONLY_ACTIONS: dict[str, list[str]] = {
+    "s3": ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+    "iam": ["iam:GetPolicy", "iam:GetRole", "iam:ListPolicies", "iam:ListRoles"],
+    "ec2": ["ec2:DescribeInstances", "ec2:DescribeSecurityGroups", "ec2:DescribeVpcs"],
+    "lambda": ["lambda:GetFunction", "lambda:ListFunctions"],
+    "rds": ["rds:DescribeDBInstances", "rds:DescribeDBClusters"],
+    "dynamodb": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan"],
+    "kms": ["kms:DescribeKey", "kms:ListKeys"],
+    "secretsmanager": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:ListSecrets",
+        "secretsmanager:DescribeSecret",
+    ],
+    "ssm": ["ssm:GetParameter", "ssm:GetParameters", "ssm:DescribeParameters"],
+    "cloudwatch": ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"],
+    "logs": ["logs:GetLogEvents", "logs:DescribeLogGroups", "logs:DescribeLogStreams"],
+    "sns": ["sns:GetTopicAttributes", "sns:ListTopics"],
+    "sqs": ["sqs:GetQueueAttributes", "sqs:ListQueues"],
+    "sts": ["sts:GetCallerIdentity"],
+}
 
 # Human-readable descriptions for known risky actions (used by analyze_policy_rules)
 _ACTION_DESCRIPTIONS: dict[str, str] = {
@@ -816,6 +848,195 @@ def escalate_policy_local(policy_json: str) -> EscalationResult:
         detected_actions=detected,
         findings=[],
         summary=summary,
+    )
+
+
+# ── Fix Function ─────────────────────────────────────────────────────────────
+
+def fix_policy_local(policy_json: str) -> FixResult:
+    """Generate a least-privilege replacement for a dangerous IAM policy.
+
+    Transformations applied to Allow statements:
+    - ``Action: "*"``          → replaced with a TODO placeholder
+    - Service wildcards        → replaced with read-only actions from SERVICE_READONLY_ACTIONS
+    - HIGH_RISK_ACTIONS        → removed from the action list
+    - ``Resource: "*"``        → kept but flagged with a resource_wildcard_warning change
+    - NotAction / NotResource  → flagged for manual review, kept unchanged
+    - Deny statements          → kept unchanged (Deny is good for security)
+
+    Args:
+        policy_json: Raw IAM policy JSON string.
+
+    Returns:
+        FixResult with the fixed policy, list of changes, and manual review notes.
+
+    Raises:
+        ValueError: If policy_json is not valid JSON or not a valid IAM policy.
+    """
+    try:
+        parsed = json.loads(policy_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Invalid JSON provided.") from exc
+
+    validate_iam_policy(parsed)
+
+    original_allowed = _extract_allowed_actions(parsed)
+    _, original_risk_level = _detect_risky_actions(original_allowed)
+
+    changes: list[FixChange] = []
+    manual_review_needed: list[str] = []
+    fixed_statements: list[dict] = []
+
+    for i, stmt in enumerate(parsed["Statement"]):
+        effect = stmt.get("Effect")
+        has_not_action = "NotAction" in stmt
+        has_not_resource = "NotResource" in stmt
+
+        # Deny → keep unchanged
+        if effect == "Deny":
+            fixed_statements.append(dict(stmt))
+            continue
+
+        # NotAction / NotResource → flag for manual review, keep unchanged
+        if has_not_action or has_not_resource:
+            fixed_statements.append(dict(stmt))
+            parts = []
+            if has_not_action:
+                parts.append("NotAction")
+            if has_not_resource:
+                parts.append("NotResource")
+            manual_review_needed.append(
+                f"Statement[{i}] uses {' and '.join(parts)} — cannot auto-fix, "
+                "manual review required"
+            )
+            continue
+
+        # Allow statement — process actions and resources
+        fixed_stmt: dict = {}
+        if "Sid" in stmt:
+            fixed_stmt["Sid"] = stmt["Sid"]
+        fixed_stmt["Effect"] = "Allow"
+
+        raw_actions = stmt.get("Action", [])
+        if isinstance(raw_actions, str):
+            raw_actions = [raw_actions]
+
+        raw_resources = stmt.get("Resource", [])
+        if isinstance(raw_resources, str):
+            raw_resources = [raw_resources]
+
+        # ── Process actions ───────────────────────────────────────────────────
+        fixed_actions: list[str] = []
+
+        if "*" in raw_actions:
+            # Full wildcard → TODO placeholder
+            fixed_actions = ["TODO:specify-needed-actions"]
+            changes.append(FixChange(
+                type="replaced_wildcard",
+                statement_index=i,
+                from_="*",
+                to=["TODO:specify-needed-actions"],
+                reason=(
+                    "Full action wildcard grants administrator access; "
+                    "specify only the actions actually needed"
+                ),
+            ))
+        else:
+            seen: set[str] = set()
+            for action in raw_actions:
+                al = action.lower()
+                if al.endswith(":*"):
+                    # Service wildcard (e.g. s3:*) → read-only replacements
+                    svc = al.split(":")[0]
+                    if svc in SERVICE_READONLY_ACTIONS:
+                        replacement = SERVICE_READONLY_ACTIONS[svc]
+                        changes.append(FixChange(
+                            type="scoped_wildcard",
+                            statement_index=i,
+                            from_=action,
+                            to=replacement,
+                            reason=(
+                                f"Service wildcard replaced with read-only "
+                                f"{svc.upper()} actions"
+                            ),
+                        ))
+                        for a in replacement:
+                            if a not in seen:
+                                seen.add(a)
+                                fixed_actions.append(a)
+                    else:
+                        placeholder = f"TODO:{svc}:specify-needed-actions"
+                        changes.append(FixChange(
+                            type="replaced_wildcard",
+                            statement_index=i,
+                            from_=action,
+                            to=[placeholder],
+                            reason=(
+                                f"Service wildcard for unknown service '{svc}'; "
+                                "specify only the actions actually needed"
+                            ),
+                        ))
+                        if placeholder not in seen:
+                            seen.add(placeholder)
+                            fixed_actions.append(placeholder)
+                elif al in HIGH_RISK_ACTIONS:
+                    # High-risk → remove
+                    changes.append(FixChange(
+                        type="removed_action",
+                        statement_index=i,
+                        action=action,
+                        reason=_ACTION_DESCRIPTIONS.get(
+                            al,
+                            f"'{action}' is a privilege escalation risk",
+                        ),
+                    ))
+                else:
+                    # Safe action → keep
+                    if action not in seen:
+                        seen.add(action)
+                        fixed_actions.append(action)
+
+            # All actions were removed → placeholder
+            if not fixed_actions:
+                fixed_actions = ["TODO:specify-needed-actions"]
+                manual_review_needed.append(
+                    f"Statement[{i}] had all actions removed — "
+                    "specify safe replacement actions"
+                )
+
+        fixed_stmt["Action"] = fixed_actions
+
+        # ── Process resources ─────────────────────────────────────────────────
+        fixed_stmt["Resource"] = stmt.get("Resource", [])
+        if "*" in raw_resources:
+            changes.append(FixChange(
+                type="resource_wildcard_warning",
+                statement_index=i,
+                reason=(
+                    "Resource '*' should be replaced with specific resource ARNs "
+                    "for least privilege"
+                ),
+            ))
+
+        if "Condition" in stmt:
+            fixed_stmt["Condition"] = stmt["Condition"]
+
+        fixed_statements.append(fixed_stmt)
+
+    fixed_policy = {
+        "Version": parsed.get("Version", "2012-10-17"),
+        "Statement": fixed_statements,
+    }
+
+    fixed_allowed = _extract_allowed_actions({"Statement": fixed_statements})
+    _, fixed_risk_level = _detect_risky_actions(fixed_allowed)
+
+    return FixResult(
+        original_risk_level=original_risk_level,
+        fixed_risk_level=fixed_risk_level,
+        fixed_policy=fixed_policy,
+        changes=changes,
+        manual_review_needed=manual_review_needed,
     )
 
 

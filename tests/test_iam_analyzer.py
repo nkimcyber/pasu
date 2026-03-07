@@ -1453,3 +1453,266 @@ class TestCliSarifOutput:
             cmd_scan(args)
         raw = buf.getvalue()
         assert "\033[" not in raw
+
+
+# ── fix_policy_local tests ────────────────────────────────────────────────────
+
+_ALL_ACTIONS_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+})
+
+_S3_WILDCARD_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}],
+})
+
+_SAFE_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                   "Resource": "arn:aws:s3:::my-bucket/*"}],
+})
+
+_DENY_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*"}],
+})
+
+_NOT_ACTION_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "NotAction": ["s3:DeleteObject"], "Resource": "*"}],
+})
+
+_MIXED_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject",
+         "Resource": "arn:aws:s3:::my-bucket/*"},
+        {"Effect": "Allow", "Action": ["s3:GetObject", "iam:PassRole"],
+         "Resource": "*"},
+    ],
+})
+
+_ALL_RISKY_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow",
+                   "Action": ["iam:PassRole", "iam:CreatePolicyVersion"],
+                   "Resource": "*"}],
+})
+
+
+class TestFixPolicyLocal:
+    """Unit tests for fix_policy_local() in analyzer.py."""
+
+    def test_fix_full_wildcard_action_replaced_with_todo(self):
+        from app.analyzer import fix_policy_local
+        result = fix_policy_local(_ALL_ACTIONS_POLICY)
+        stmt = result.fixed_policy["Statement"][0]
+        assert stmt["Action"] == ["TODO:specify-needed-actions"]
+        replaced = [c for c in result.changes if c.type == "replaced_wildcard"]
+        assert len(replaced) == 1
+        assert replaced[0].from_ == "*"
+
+    def test_fix_service_wildcard_s3_replaced_with_readonly(self):
+        from app.analyzer import fix_policy_local
+        result = fix_policy_local(_S3_WILDCARD_POLICY)
+        stmt = result.fixed_policy["Statement"][0]
+        assert "s3:GetObject" in stmt["Action"]
+        assert "s3:ListBucket" in stmt["Action"]
+        assert "s3:*" not in stmt["Action"]
+        scoped = [c for c in result.changes if c.type == "scoped_wildcard"]
+        assert len(scoped) == 1
+        assert scoped[0].from_ == "s3:*"
+        assert "s3:GetObject" in (scoped[0].to or [])
+
+    def test_fix_high_risk_action_removed(self):
+        from app.analyzer import fix_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow",
+                           "Action": ["s3:GetObject", "iam:PassRole"],
+                           "Resource": "arn:aws:s3:::bucket/*"}],
+        })
+        result = fix_policy_local(policy)
+        stmt = result.fixed_policy["Statement"][0]
+        assert "iam:PassRole" not in stmt["Action"]
+        assert "s3:GetObject" in stmt["Action"]
+        removed = [c for c in result.changes if c.type == "removed_action"]
+        assert any("PassRole" in (c.action or "") for c in removed)
+
+    def test_fix_deny_statement_preserved_unchanged(self):
+        from app.analyzer import fix_policy_local
+        result = fix_policy_local(_DENY_POLICY)
+        stmt = result.fixed_policy["Statement"][0]
+        assert stmt["Effect"] == "Deny"
+        assert stmt["Action"] == "s3:DeleteObject"
+        assert result.changes == []
+        assert result.manual_review_needed == []
+
+    def test_fix_not_action_flagged_as_manual_review(self):
+        from app.analyzer import fix_policy_local
+        result = fix_policy_local(_NOT_ACTION_POLICY)
+        assert len(result.manual_review_needed) > 0
+        assert any("NotAction" in note for note in result.manual_review_needed)
+        # Statement kept unchanged
+        stmt = result.fixed_policy["Statement"][0]
+        assert "NotAction" in stmt
+
+    def test_fix_resource_wildcard_produces_warning_change(self):
+        from app.analyzer import fix_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}],
+        })
+        result = fix_policy_local(policy)
+        warnings = [c for c in result.changes if c.type == "resource_wildcard_warning"]
+        assert len(warnings) == 1
+        assert "specific resource ARNs" in warnings[0].reason
+
+    def test_fix_already_safe_policy_returns_unchanged(self):
+        from app.analyzer import fix_policy_local
+        result = fix_policy_local(_SAFE_POLICY)
+        assert result.changes == []
+        assert result.manual_review_needed == []
+        stmt = result.fixed_policy["Statement"][0]
+        action = stmt["Action"]
+        # fix normalises string Actions to lists; accept either form
+        assert action == ["s3:GetObject"] or action == "s3:GetObject"
+        assert stmt["Resource"] == "arn:aws:s3:::my-bucket/*"
+
+    def test_fix_mixed_policy_only_fixes_dangerous_parts(self):
+        from app.analyzer import fix_policy_local
+        result = fix_policy_local(_MIXED_POLICY)
+        # Statement 0: safe — unchanged
+        s0 = result.fixed_policy["Statement"][0]
+        assert s0["Action"] == ["s3:GetObject"] or s0["Action"] == "s3:GetObject"
+        # Statement 1: iam:PassRole must be gone
+        s1 = result.fixed_policy["Statement"][1]
+        assert "iam:PassRole" not in s1["Action"]
+        # s3:GetObject is safe, should remain
+        assert "s3:GetObject" in s1["Action"]
+
+    def test_fix_all_high_risk_actions_replaced_with_placeholder(self):
+        from app.analyzer import fix_policy_local
+        result = fix_policy_local(_ALL_RISKY_POLICY)
+        stmt = result.fixed_policy["Statement"][0]
+        # Must not be empty; should have TODO placeholder
+        assert len(stmt["Action"]) > 0
+        assert any("TODO" in a for a in stmt["Action"])
+        assert any("had all actions removed" in note
+                   for note in result.manual_review_needed)
+
+    def test_fix_service_wildcard_deduplicates_actions(self):
+        from app.analyzer import fix_policy_local
+        # s3:* expands to include s3:GetObject; s3:GetObject is also listed → no duplicate
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow",
+                           "Action": ["s3:*", "s3:GetObject"],
+                           "Resource": "*"}],
+        })
+        result = fix_policy_local(policy)
+        actions = result.fixed_policy["Statement"][0]["Action"]
+        assert len(actions) == len(set(actions)), "Duplicate actions found in fixed policy"
+
+    def test_fix_original_and_fixed_risk_levels_reported(self):
+        from app.analyzer import fix_policy_local
+        result = fix_policy_local(_ALL_ACTIONS_POLICY)
+        assert result.original_risk_level in ("High", "Medium", "Low")
+        assert result.fixed_risk_level in ("High", "Medium", "Low")
+        # After fixing *, risk should drop
+        assert result.original_risk_level == "High"
+
+    def test_fix_condition_preserved_on_safe_action(self):
+        from app.analyzer import fix_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::bucket/*",
+                "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1"}},
+            }],
+        })
+        result = fix_policy_local(policy)
+        stmt = result.fixed_policy["Statement"][0]
+        assert "Condition" in stmt
+        assert stmt["Condition"]["StringEquals"]["aws:RequestedRegion"] == "us-east-1"
+
+    def test_fix_invalid_json_raises(self):
+        from app.analyzer import fix_policy_local
+        with pytest.raises(ValueError, match="Invalid JSON"):
+            fix_policy_local("not json")
+
+    def test_fix_missing_statement_raises(self):
+        from app.analyzer import fix_policy_local
+        with pytest.raises(ValueError):
+            fix_policy_local(json.dumps({"Version": "2012-10-17"}))
+
+
+# ── CLI fix command tests ─────────────────────────────────────────────────────
+
+def _make_fix_args(tmp_path, policy_text, fmt="text", output=None):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(policy_text)
+    return argparse.Namespace(file=str(policy_file), format=fmt, output=output)
+
+
+class TestCliFixOutput:
+    """Tests for the 'pasu fix' CLI command."""
+
+    def test_fix_json_format_has_required_keys(self, tmp_path):
+        from app.cli import cmd_fix
+        args = _make_fix_args(tmp_path, _ALL_ACTIONS_POLICY, fmt="json")
+        with _capture_stdout() as buf:
+            cmd_fix(args)
+        data = json.loads(buf.getvalue())
+        assert data["status"] == "success"
+        assert "original_risk_level" in data
+        assert "fixed_risk_level" in data
+        assert "fixed_policy" in data
+        assert "changes" in data
+        assert "manual_review_needed" in data
+
+    def test_fix_json_changes_use_from_key(self, tmp_path):
+        from app.cli import cmd_fix
+        args = _make_fix_args(tmp_path, _S3_WILDCARD_POLICY, fmt="json")
+        with _capture_stdout() as buf:
+            cmd_fix(args)
+        data = json.loads(buf.getvalue())
+        scoped = [c for c in data["changes"] if c["type"] == "scoped_wildcard"]
+        assert len(scoped) > 0
+        assert "from" in scoped[0]
+        assert scoped[0]["from"] == "s3:*"
+
+    def test_fix_output_flag_writes_fixed_policy_to_file(self, tmp_path):
+        from app.cli import cmd_fix
+        output_file = tmp_path / "fixed.json"
+        args = _make_fix_args(tmp_path, _ALL_ACTIONS_POLICY, output=str(output_file))
+        with _capture_stdout() as buf:
+            cmd_fix(args)
+        assert output_file.exists()
+        saved = json.loads(output_file.read_text())
+        assert "Statement" in saved
+        assert "Version" in saved
+
+    def test_fix_text_format_prints_fixed_policy(self, tmp_path):
+        from app.cli import cmd_fix
+        args = _make_fix_args(tmp_path, _ALL_ACTIONS_POLICY, fmt="text")
+        with _capture_stdout() as buf:
+            cmd_fix(args)
+        output = buf.getvalue()
+        # Should contain the JSON policy block and a summary header
+        assert "Fixed Policy" in output or "Statement" in output
+
+    def test_fix_json_error_on_missing_file(self, tmp_path):
+        from app.cli import cmd_fix
+        args = argparse.Namespace(
+            file=str(tmp_path / "nonexistent.json"), format="json", output=None
+        )
+        with _capture_stdout() as buf:
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_fix(args)
+        assert exc_info.value.code == 1
+        data = json.loads(buf.getvalue())
+        assert data["status"] == "error"

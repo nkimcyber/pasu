@@ -24,6 +24,7 @@ from app.analyzer import (
     escalate_policy_local,
     explain_policy,
     explain_policy_local,
+    fix_policy_local,
 )
 
 
@@ -401,6 +402,85 @@ def cmd_scan(args: argparse.Namespace) -> None:
         _print_scan(explain_result, escalate_result)
 
 
+# ── Fix formatters and handler ────────────────────────────────────────────────
+
+def _fix_to_json(result) -> dict:
+    return {
+        "original_risk_level": result.original_risk_level,
+        "fixed_risk_level": result.fixed_risk_level,
+        "fixed_policy": result.fixed_policy,
+        "changes": [
+            c.model_dump(by_alias=True, exclude_none=True) for c in result.changes
+        ],
+        "manual_review_needed": result.manual_review_needed,
+        "status": result.status,
+    }
+
+
+def _print_fix(result, output_path: str | None = None) -> None:
+    orig_code = _risk_color(result.original_risk_level)
+    fixed_code = _risk_color(result.fixed_risk_level)
+    print(_header("IAM Policy Fix Report"))
+    print(
+        _section("Risk Level")
+        + f"  {_color(result.original_risk_level, _BOLD + orig_code)}"
+        + f"  →  {_color(result.fixed_risk_level, _BOLD + fixed_code)}"
+    )
+
+    if result.changes:
+        print(_section("Changes Applied"))
+        for change in result.changes:
+            if change.type == "removed_action":
+                print(f"  • Removed {_color(change.action or '', _RED)}: {change.reason}")
+            elif change.type in ("scoped_wildcard", "replaced_wildcard"):
+                from_str = _color(change.from_ or "", _YELLOW)
+                to_str = _color(", ".join(change.to or []), _GREEN)
+                print(f"  • {from_str}  →  {to_str}")
+                print(f"      {change.reason}")
+            elif change.type == "resource_wildcard_warning":
+                print(f"  • {_color('WARNING', _YELLOW)}: {change.reason}")
+
+    if result.manual_review_needed:
+        print(_section("Manual Review Required"))
+        for note in result.manual_review_needed:
+            print(f"  • {_color(note, _YELLOW)}")
+
+    print(_section("Fixed Policy"))
+    print(json.dumps(result.fixed_policy, indent=2))
+
+    if output_path:
+        print(_section("Saved"))
+        print(f"  Fixed policy written to: {output_path}")
+
+
+def cmd_fix(args: argparse.Namespace) -> None:
+    use_machine = args.format != "text"
+    try:
+        policy_json = _load_policy(args.file)
+    except (FileNotFoundError, ValueError) as exc:
+        _handle_error(str(exc), use_machine)
+        return
+
+    try:
+        result = fix_policy_local(policy_json=policy_json)
+    except ValueError as exc:
+        _handle_error(f"Validation error: {exc}", use_machine)
+        return
+
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(result.fixed_policy, indent=2))
+        except OSError as exc:
+            _handle_error(f"Cannot write output file: {exc}", use_machine)
+            return
+
+    if args.format == "json":
+        print(json.dumps(_fix_to_json(result), indent=2))
+    else:
+        _print_fix(result, args.output)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -463,9 +543,31 @@ def main() -> None:
     p_scan.add_argument("--format", **_format_kwargs)
     p_scan.set_defaults(func=cmd_scan)
 
+    # fix
+    p_fix = subparsers.add_parser(
+        "fix",
+        help="Generate a least-privilege replacement for a dangerous policy.",
+    )
+    p_fix.add_argument("--file", required=True, metavar="FILE",
+                       help="Path to the IAM policy JSON file.")
+    p_fix.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        metavar="FORMAT",
+        help="Output format: 'text' (default) or 'json'.",
+    )
+    p_fix.add_argument(
+        "--output", "-o",
+        default=None,
+        metavar="FILE",
+        help="Write the fixed policy JSON to this file.",
+    )
+    p_fix.set_defaults(func=cmd_fix)
+
     args = parser.parse_args()
     # Banner is suppressed for machine-readable formats and when -q/--quiet is set
-    if not args.quiet and args.format == "text":
+    if not args.quiet and getattr(args, "format", "text") == "text":
         _print_banner()
     args.func(args)
 
