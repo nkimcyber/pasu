@@ -2,9 +2,9 @@
 cli.py — Command-line interface for the IAM Analyzer.
 
 Usage:
-    pasu explain  --file policy.json [--format json]
-    pasu escalate --file policy.json [--format json]
-    pasu scan     --file policy.json [--format json]
+    pasu explain  --file policy.json [--format json|sarif]
+    pasu escalate --file policy.json [--format json|sarif]
+    pasu scan     --file policy.json [--format json|sarif]
 """
 
 import argparse
@@ -12,6 +12,7 @@ import importlib.metadata
 import io
 import json
 import os
+import re
 import sys
 
 from app.analyzer import (
@@ -220,89 +221,182 @@ def _scan_to_json(explain_result, escalate_result, rule_findings) -> dict:
     }
 
 
+# ── SARIF output formatters ───────────────────────────────────────────────────
+
+def _pascal(text: str) -> str:
+    """Convert a phrase to PascalCase: 'Unrestricted resource access' → 'UnrestrictedResourceAccess'."""
+    return "".join(w.capitalize() for w in re.split(r"\W+", text) if w)
+
+
+def _build_sarif(policy_path: str, rule_findings, escalate_result) -> dict:
+    """Build a SARIF 2.1.0 document from pasu findings.
+
+    Args:
+        policy_path: Path to the policy file (used as artifact URI).
+        rule_findings: List of RuleFinding from analyze_policy_rules().
+        escalate_result: EscalationResult (may be None for explain-only runs).
+
+    Returns:
+        SARIF 2.1.0 dict ready for json.dumps().
+    """
+    try:
+        version = importlib.metadata.version("pasu")
+    except importlib.metadata.PackageNotFoundError:
+        version = "0.2.0"
+
+    _SEV = {"high": "error", "medium": "warning", "low": "note"}
+
+    rules_dict: dict[str, dict] = {}  # rule_id → SARIF rule entry (deduped)
+    results: list[dict] = []
+
+    # ── Rule-engine findings (R001–R007) ──────────────────────────────────────
+    for finding in rule_findings:
+        if finding.rule_id not in rules_dict:
+            rules_dict[finding.rule_id] = {
+                "id": finding.rule_id,
+                "name": _pascal(finding.title),
+                "shortDescription": {"text": finding.title},
+                "helpUri": "https://pypi.org/project/pasu/",
+            }
+        results.append({
+            "ruleId": finding.rule_id,
+            "level": _SEV.get(finding.severity, "note"),
+            "message": {"text": finding.description},
+            "locations": [{"physicalLocation": {"artifactLocation": {"uri": policy_path}}}],
+        })
+
+    # ── Detected risky actions (from escalate) ────────────────────────────────
+    if escalate_result:
+        for action in escalate_result.detected_actions:
+            al = action.lower()
+            rule_id = "PASU-" + al.replace(":", "-").replace("*", "wildcard").upper()
+            level = "error" if al in HIGH_RISK_ACTIONS else "warning"
+            if rule_id not in rules_dict:
+                rules_dict[rule_id] = {
+                    "id": rule_id,
+                    "name": _pascal(f"RiskyAction {action}"),
+                    "shortDescription": {"text": f"Risky IAM action: {action}"},
+                    "helpUri": "https://pypi.org/project/pasu/",
+                }
+            results.append({
+                "ruleId": rule_id,
+                "level": level,
+                "message": {"text": f"Policy grants the risky action '{action}'."},
+                "locations": [{"physicalLocation": {"artifactLocation": {"uri": policy_path}}}],
+            })
+
+    return {
+        "$schema": (
+            "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/"
+            "sarif-2.1/schema/sarif-schema-2.1.0.json"
+        ),
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "pasu",
+                    "version": version,
+                    "informationUri": "https://pypi.org/project/pasu/",
+                    "rules": list(rules_dict.values()),
+                }
+            },
+            "results": results,
+        }],
+    }
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 def cmd_explain(args: argparse.Namespace) -> None:
-    use_json = args.format == "json"
+    use_machine = args.format != "text"  # json or sarif → machine-readable errors
     try:
         policy_json = _load_policy(args.file)
     except (FileNotFoundError, ValueError) as exc:
-        _handle_error(str(exc), use_json)
+        _handle_error(str(exc), use_machine)
         return
 
     try:
         if args.ai:
-            _require_api_key(use_json)
+            _require_api_key(use_machine)
             result = explain_policy(policy_json=policy_json)
         else:
             result = explain_policy_local(policy_json=policy_json)
     except ValueError as exc:
-        _handle_error(f"Validation error: {exc}", use_json)
+        _handle_error(f"Validation error: {exc}", use_machine)
         return
     except RuntimeError as exc:
-        _handle_error(str(exc), use_json)
+        _handle_error(str(exc), use_machine)
         return
 
-    if use_json:
+    if args.format == "json":
         print(json.dumps(_explain_to_json(result), indent=2))
+    elif args.format == "sarif":
+        # explain produces no security findings; emit a valid empty-results SARIF
+        print(json.dumps(_build_sarif(args.file, [], None), indent=2))
     else:
         _print_explain(result)
 
 
 def cmd_escalate(args: argparse.Namespace) -> None:
-    use_json = args.format == "json"
+    use_machine = args.format != "text"
     try:
         policy_json = _load_policy(args.file)
     except (FileNotFoundError, ValueError) as exc:
-        _handle_error(str(exc), use_json)
+        _handle_error(str(exc), use_machine)
         return
 
     try:
         if args.ai:
-            _require_api_key(use_json)
+            _require_api_key(use_machine)
             result = escalate_policy(policy_json=policy_json)
         else:
             result = escalate_policy_local(policy_json=policy_json)
-        rule_findings = analyze_policy_rules(policy_json) if use_json else []
+        need_findings = args.format in ("json", "sarif")
+        rule_findings = analyze_policy_rules(policy_json) if need_findings else []
     except ValueError as exc:
-        _handle_error(f"Validation error: {exc}", use_json)
+        _handle_error(f"Validation error: {exc}", use_machine)
         return
     except RuntimeError as exc:
-        _handle_error(str(exc), use_json)
+        _handle_error(str(exc), use_machine)
         return
 
-    if use_json:
+    if args.format == "json":
         print(json.dumps(_escalate_to_json(result, rule_findings), indent=2))
+    elif args.format == "sarif":
+        print(json.dumps(_build_sarif(args.file, rule_findings, result), indent=2))
     else:
         _print_escalate(result)
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
-    use_json = args.format == "json"
+    use_machine = args.format != "text"
     try:
         policy_json = _load_policy(args.file)
     except (FileNotFoundError, ValueError) as exc:
-        _handle_error(str(exc), use_json)
+        _handle_error(str(exc), use_machine)
         return
 
     try:
         if args.ai:
-            _require_api_key(use_json)
+            _require_api_key(use_machine)
             explain_result = explain_policy(policy_json=policy_json)
             escalate_result = escalate_policy(policy_json=policy_json)
         else:
             explain_result = explain_policy_local(policy_json=policy_json)
             escalate_result = escalate_policy_local(policy_json=policy_json)
-        rule_findings = analyze_policy_rules(policy_json) if use_json else []
+        need_findings = args.format in ("json", "sarif")
+        rule_findings = analyze_policy_rules(policy_json) if need_findings else []
     except ValueError as exc:
-        _handle_error(f"Validation error: {exc}", use_json)
+        _handle_error(f"Validation error: {exc}", use_machine)
         return
     except RuntimeError as exc:
-        _handle_error(str(exc), use_json)
+        _handle_error(str(exc), use_machine)
         return
 
-    if use_json:
+    if args.format == "json":
         print(json.dumps(_scan_to_json(explain_result, escalate_result, rule_findings), indent=2))
+    elif args.format == "sarif":
+        print(json.dumps(_build_sarif(args.file, rule_findings, escalate_result), indent=2))
     else:
         _print_scan(explain_result, escalate_result)
 
@@ -330,10 +424,10 @@ def main() -> None:
         help="Use Claude AI for analysis (requires ANTHROPIC_API_KEY).",
     )
     _format_kwargs = dict(
-        choices=["text", "json"],
+        choices=["text", "json", "sarif"],
         default="text",
         metavar="FORMAT",
-        help="Output format: 'text' (default) or 'json' (machine-readable, suppresses banner).",
+        help="Output format: 'text' (default), 'json', or 'sarif' (SARIF v2.1.0 for GitHub Code Scanning).",
     )
 
     # explain
@@ -370,8 +464,8 @@ def main() -> None:
     p_scan.set_defaults(func=cmd_scan)
 
     args = parser.parse_args()
-    # Banner is suppressed in JSON mode (clean stdout) and when -q/--quiet is set
-    if not args.quiet and args.format != "json":
+    # Banner is suppressed for machine-readable formats and when -q/--quiet is set
+    if not args.quiet and args.format == "text":
         _print_banner()
     args.func(args)
 

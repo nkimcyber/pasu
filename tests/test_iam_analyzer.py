@@ -1337,3 +1337,119 @@ class TestCliJsonOutput:
         # Text output is not a JSON object
         with pytest.raises(json.JSONDecodeError):
             json.loads(raw)
+
+
+# ── CLI --format sarif tests ──────────────────────────────────────────────────
+
+_SARIF_SCHEMA = (
+    "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/"
+    "sarif-2.1/schema/sarif-schema-2.1.0.json"
+)
+
+
+class TestCliSarifOutput:
+    """--format sarif produces valid SARIF 2.1.0 output."""
+
+    def test_sarif_has_required_schema_fields(self, tmp_path):
+        from app.cli import cmd_scan
+        args = _make_args(tmp_path, "scan", _RISKY_POLICY, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_scan(args)
+        doc = json.loads(buf.getvalue())
+        assert doc["$schema"] == _SARIF_SCHEMA
+        assert doc["version"] == "2.1.0"
+        assert isinstance(doc["runs"], list)
+        assert len(doc["runs"]) == 1
+
+    def test_sarif_driver_metadata(self, tmp_path):
+        from app.cli import cmd_scan
+        args = _make_args(tmp_path, "scan", _RISKY_POLICY, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_scan(args)
+        driver = json.loads(buf.getvalue())["runs"][0]["tool"]["driver"]
+        assert driver["name"] == "pasu"
+        assert "version" in driver
+        assert driver["informationUri"] == "https://pypi.org/project/pasu/"
+        assert isinstance(driver["rules"], list)
+
+    def test_sarif_high_risk_action_maps_to_error_level(self, tmp_path):
+        from app.cli import cmd_escalate
+        # iam:PassRole is HIGH_RISK → level "error"
+        args = _make_args(tmp_path, "escalate", _RISKY_POLICY, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        doc = json.loads(buf.getvalue())
+        results = doc["runs"][0]["results"]
+        action_results = [r for r in results if "PASU-" in r["ruleId"]]
+        assert len(action_results) > 0
+        assert all(r["level"] == "error" for r in action_results)
+
+    def test_sarif_medium_risk_action_maps_to_warning_level(self, tmp_path):
+        from app.cli import cmd_escalate
+        medium_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "*"}],
+        })
+        args = _make_args(tmp_path, "escalate", medium_policy, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        doc = json.loads(buf.getvalue())
+        results = doc["runs"][0]["results"]
+        action_results = [r for r in results if "PASU-" in r["ruleId"]]
+        assert len(action_results) > 0
+        assert all(r["level"] == "warning" for r in action_results)
+
+    def test_sarif_rule_finding_severity_mapping(self, tmp_path):
+        from app.cli import cmd_escalate
+        # iam:PassRole + Resource:* → R001 (high→error), R003 (high→error), R005 (medium→warning)
+        args = _make_args(tmp_path, "escalate", _RISKY_POLICY, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        doc = json.loads(buf.getvalue())
+        results = doc["runs"][0]["results"]
+        rule_results = {r["ruleId"]: r["level"] for r in results if not r["ruleId"].startswith("PASU-")}
+        assert rule_results.get("R001") == "error"
+        assert rule_results.get("R003") == "error"
+        assert rule_results.get("R005") == "warning"
+
+    def test_sarif_artifact_location_matches_file_path(self, tmp_path):
+        from app.cli import cmd_scan
+        args = _make_args(tmp_path, "scan", _RISKY_POLICY, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_scan(args)
+        doc = json.loads(buf.getvalue())
+        results = doc["runs"][0]["results"]
+        assert len(results) > 0
+        for result in results:
+            uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            assert str(tmp_path) in uri or "policy.json" in uri
+
+    def test_sarif_rules_list_matches_results(self, tmp_path):
+        """Every ruleId in results must have a matching entry in driver.rules."""
+        from app.cli import cmd_scan
+        args = _make_args(tmp_path, "scan", _RISKY_POLICY, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_scan(args)
+        doc = json.loads(buf.getvalue())
+        run = doc["runs"][0]
+        rule_ids = {r["id"] for r in run["tool"]["driver"]["rules"]}
+        for result in run["results"]:
+            assert result["ruleId"] in rule_ids
+
+    def test_sarif_explain_produces_empty_results(self, tmp_path):
+        """explain --format sarif emits valid SARIF with no findings."""
+        from app.cli import cmd_explain
+        args = _make_args(tmp_path, "explain", _SIMPLE_POLICY, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_explain(args)
+        doc = json.loads(buf.getvalue())
+        assert doc["version"] == "2.1.0"
+        assert doc["runs"][0]["results"] == []
+
+    def test_sarif_output_contains_no_ansi_codes(self, tmp_path):
+        from app.cli import cmd_scan
+        args = _make_args(tmp_path, "scan", _RISKY_POLICY, fmt="sarif")
+        with _capture_stdout() as buf:
+            cmd_scan(args)
+        raw = buf.getvalue()
+        assert "\033[" not in raw
