@@ -1,0 +1,130 @@
+name: IAM Analyzer CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11.9"
+
+jobs:
+  # ── Job 1: Run the test suite ─────────────────────────────────────────────
+  test:
+    name: Run Pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests and capture output
+        id: run_tests
+        # Always continue so the debug job can receive the output
+        continue-on-error: true
+        run: |
+          pytest tests/ \
+            --tb=short \
+            --no-header \
+            -q \
+            2>&1 | tee pytest_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      - name: Upload test output artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: pytest_output.txt
+
+      # Fail the job explicitly after uploading the artifact
+      - name: Fail if tests did not pass
+        if: steps.run_tests.outputs.exit_code != '0'
+        run: exit 1
+
+  # ── Job 2: Debug Agent — runs only when tests fail ────────────────────────
+  debug:
+    name: Auto-Debug (Claude)
+    runs-on: ubuntu-latest
+    needs: test
+    if: failure()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download pytest output
+        uses: actions/download-artifact@v4
+        with:
+          name: pytest-output
+
+      - name: Run Debug Agent against analyzer module
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python scripts/debug_agent.py \
+            --trace pytest_output.txt \
+            --file app/analyzer.py
+
+      - name: Upload patched analyzer for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-analyzer
+          path: app/analyzer.py
+
+  # ── Job 3: Prepare final code for review — runs only when tests pass ──────
+  prepare-review:
+    name: Prepare Code for Review
+    runs-on: ubuntu-latest
+    needs: test
+    if: success()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Confirm all tests pass (final gate)
+        run: pytest tests/ --tb=short -q
+
+      - name: Archive reviewed source
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviewed-source
+          path: |
+            app/
+            tests/
+            requirements.txt
