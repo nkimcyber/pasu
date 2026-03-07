@@ -30,3 +30,21 @@ class AnalysisResult(BaseModel):
     policy_arn: str
     findings: str = Field(..., description="Claude's security analysis of the policy.")
     status: str = Field(default="ok")
+
+
+class ExplainRequest(BaseModel):
+    """Request body for the /explain endpoint."""
+
+    policy_json: str = Field(
+        ..., description="Raw IAM policy JSON string pasted by the user."
+    )
+
+
+class ExplainResult(BaseModel):
+    """Response model returned by the /explain endpoint."""
+
+    summary: str = Field(..., description="One-sentence plain English summary.")
+    details: list[str] = Field(
+        ..., description="Bullet point list of what each statement does."
+    )
+    status: str = Field(default="ok")

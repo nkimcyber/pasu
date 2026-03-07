@@ -3,11 +3,14 @@ main.py — FastAPI application entry point for the IAM Analyzer Project.
 """
 
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
-from app.analyzer import analyze_policy
-from app.models import AnalysisResult, AnalyzeRequest
+from app.analyzer import analyze_policy, explain_policy
+from app.models import AnalysisResult, AnalyzeRequest, ExplainRequest, ExplainResult
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,7 +21,42 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# Mount static files if the directory exists
+_static_dir = Path(__file__).parent / "static"
+if _static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
 router = APIRouter(prefix="/api/v1", tags=["iam"])
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    """Serve the Web UI."""
+    html_path = Path(__file__).parent / "static" / "index.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+@router.post("/explain", response_model=ExplainResult)
+def explain(request: ExplainRequest) -> ExplainResult:
+    """Explain a pasted IAM policy JSON in plain English.
+
+    Args:
+        request: ExplainRequest containing the raw policy JSON string.
+
+    Returns:
+        ExplainResult with a one-sentence summary and bullet point details.
+
+    Raises:
+        HTTPException 400: If the JSON is invalid.
+        HTTPException 500: On Claude API failure.
+    """
+    try:
+        return explain_policy(policy_json=request.policy_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.error("Explain failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/analyze", response_model=AnalysisResult)

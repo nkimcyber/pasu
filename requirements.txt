@@ -1,0 +1,8 @@
+fastapi
+pytest
+boto3
+anthropic
+pydantic
+httpx
+python-multipart
+uvicorn

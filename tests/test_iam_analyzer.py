@@ -5,6 +5,7 @@ Covers:
 - Pydantic model validation
 - aws_client helpers (mocked boto3)
 - analyzer.analyze_policy (mocked boto3 + Claude)
+- analyzer.explain_policy (mocked Claude)
 - FastAPI endpoints via TestClient
 """
 
@@ -15,12 +16,29 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models import AnalysisResult, AnalyzeRequest, IAMPolicyResponse
+from app.models import (
+    AnalysisResult,
+    AnalyzeRequest,
+    ExplainRequest,
+    ExplainResult,
+    IAMPolicyResponse,
+)
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+# ── Shared Test Constants ─────────────────────────────────────────────────────
 
 VALID_POLICY_ARN = "arn:aws:iam::123456789012:policy/TestPolicy"
 VALID_ACCOUNT_ID = "123456789012"
+
+VALID_POLICY_JSON = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::XYZ/*",
+        }
+    ],
+})
 
 MOCK_POLICY_META = {
     "PolicyName": "TestPolicy",
@@ -49,8 +67,22 @@ MOCK_CLAUDE_FINDINGS = (
     "3) Resource scope is '*' — restrict to specific ARNs."
 )
 
+MOCK_EXPLAIN_RESPONSE = {
+    "summary": "This policy allows reading files from the S3 bucket XYZ.",
+    "details": [
+        "Allows reading (downloading) any file stored inside the S3 bucket named XYZ."
+    ],
+}
 
-# ── Model Tests ───────────────────────────────────────────────────────────────
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def client():
+    return TestClient(app)
+
+
+# ── AnalyzeRequest Model Tests ────────────────────────────────────────────────
 
 class TestAnalyzeRequest:
     def test_valid_request(self):
@@ -67,6 +99,8 @@ class TestAnalyzeRequest:
             AnalyzeRequest(policy_arn=VALID_POLICY_ARN)
 
 
+# ── IAMPolicyResponse Model Tests ─────────────────────────────────────────────
+
 class TestIAMPolicyResponse:
     def test_valid_model(self):
         policy = IAMPolicyResponse(**MOCK_POLICY_META)
@@ -79,6 +113,8 @@ class TestIAMPolicyResponse:
         with pytest.raises(Exception):
             IAMPolicyResponse(**incomplete)
 
+
+# ── AnalysisResult Model Tests ────────────────────────────────────────────────
 
 class TestAnalysisResult:
     def test_valid_result(self):
@@ -94,6 +130,35 @@ class TestAnalysisResult:
             policy_arn=VALID_POLICY_ARN,
             findings="some findings",
         )
+        assert result.status == "ok"
+
+
+# ── ExplainRequest Model Tests ────────────────────────────────────────────────
+
+class TestExplainRequest:
+    def test_valid_request(self):
+        req = ExplainRequest(policy_json=VALID_POLICY_JSON)
+        assert req.policy_json == VALID_POLICY_JSON
+
+    def test_missing_policy_json_raises(self):
+        with pytest.raises(Exception):
+            ExplainRequest()
+
+
+# ── ExplainResult Model Tests ─────────────────────────────────────────────────
+
+class TestExplainResult:
+    def test_valid_result(self):
+        result = ExplainResult(
+            summary=MOCK_EXPLAIN_RESPONSE["summary"],
+            details=MOCK_EXPLAIN_RESPONSE["details"],
+        )
+        assert result.status == "ok"
+        assert "XYZ" in result.summary
+        assert len(result.details) == 1
+
+    def test_default_status_is_ok(self):
+        result = ExplainResult(summary="test", details=["detail one"])
         assert result.status == "ok"
 
 
@@ -180,7 +245,7 @@ class TestListPolicies:
             list_policies()
 
 
-# ── analyzer Tests ────────────────────────────────────────────────────────────
+# ── analyzer.analyze_policy Tests ────────────────────────────────────────────
 
 class TestAnalyzePolicy:
     @patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"})
@@ -244,19 +309,67 @@ class TestAnalyzePolicy:
             analyze_policy(VALID_POLICY_ARN, VALID_ACCOUNT_ID)
 
 
-# ── FastAPI Endpoint Tests ────────────────────────────────────────────────────
+# ── analyzer.explain_policy Tests ────────────────────────────────────────────
 
-@pytest.fixture
-def client():
-    return TestClient(app)
+class TestExplainPolicy:
+    @patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"})
+    @patch("app.analyzer.anthropic.Anthropic")
+    def test_returns_explain_result(self, mock_anthropic_cls):
+        mock_content = MagicMock()
+        mock_content.text = json.dumps(MOCK_EXPLAIN_RESPONSE)
+        mock_response = MagicMock()
+        mock_response.content = [mock_content]
+        mock_anthropic_cls.return_value.messages.create.return_value = mock_response
+
+        from app.analyzer import explain_policy
+        result = explain_policy(VALID_POLICY_JSON)
+
+        assert isinstance(result, ExplainResult)
+        assert "XYZ" in result.summary
+        assert len(result.details) == 1
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_raises_if_api_key_missing(self):
+        from app.analyzer import explain_policy
+        with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+            explain_policy(VALID_POLICY_JSON)
+
+    @patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"})
+    def test_raises_on_invalid_json(self):
+        from app.analyzer import explain_policy
+        with pytest.raises(ValueError, match="Invalid JSON"):
+            explain_policy("this is not json")
+
+    @patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"})
+    @patch("app.analyzer.anthropic.Anthropic")
+    def test_raises_on_claude_api_failure(self, mock_anthropic_cls):
+        import anthropic as anthropic_lib
+        mock_anthropic_cls.return_value.messages.create.side_effect = (
+            anthropic_lib.APIError(
+                message="API error",
+                request=MagicMock(),
+                body=None,
+            )
+        )
+        from app.analyzer import explain_policy
+        with pytest.raises(RuntimeError, match="Claude explain failed"):
+            explain_policy(VALID_POLICY_JSON)
+
+    @patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"})
+    @patch("app.analyzer.anthropic.Anthropic")
+    def test_raises_on_non_json_claude_response(self, mock_anthropic_cls):
+        mock_content = MagicMock()
+        mock_content.text = "Sorry, I cannot help with that."
+        mock_response = MagicMock()
+        mock_response.content = [mock_content]
+        mock_anthropic_cls.return_value.messages.create.return_value = mock_response
+
+        from app.analyzer import explain_policy
+        with pytest.raises(RuntimeError, match="unexpected response format"):
+            explain_policy(VALID_POLICY_JSON)
 
 
-class TestHealthEndpoint:
-    def test_health_returns_ok(self, client):
-        response = client.get("/api/v1/health")
-        assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
-
+# ── FastAPI /analyze Endpoint Tests ──────────────────────────────────────────
 
 class TestAnalyzeEndpoint:
     @patch("app.main.analyze_policy")
@@ -283,3 +396,61 @@ class TestAnalyzeEndpoint:
         response = client.post("/api/v1/analyze", json=payload)
         assert response.status_code == 500
         assert "IAM get_policy failed" in response.json()["detail"]
+
+
+# ── FastAPI /explain Endpoint Tests ──────────────────────────────────────────
+
+class TestExplainEndpoint:
+    @patch("app.main.explain_policy")
+    def test_explain_returns_200_with_valid_input(self, mock_explain, client):
+        mock_explain.return_value = ExplainResult(
+            summary=MOCK_EXPLAIN_RESPONSE["summary"],
+            details=MOCK_EXPLAIN_RESPONSE["details"],
+        )
+        response = client.post(
+            "/api/v1/explain",
+            json={"policy_json": VALID_POLICY_JSON},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "XYZ" in data["summary"]
+        assert isinstance(data["details"], list)
+
+    def test_explain_returns_422_on_missing_field(self, client):
+        response = client.post("/api/v1/explain", json={})
+        assert response.status_code == 422
+
+    @patch("app.main.explain_policy")
+    def test_explain_returns_400_on_invalid_json(self, mock_explain, client):
+        mock_explain.side_effect = ValueError("Invalid JSON provided.")
+        response = client.post(
+            "/api/v1/explain",
+            json={"policy_json": "not json"},
+        )
+        assert response.status_code == 400
+
+    @patch("app.main.explain_policy")
+    def test_explain_returns_500_on_runtime_error(self, mock_explain, client):
+        mock_explain.side_effect = RuntimeError("Claude explain failed")
+        response = client.post(
+            "/api/v1/explain",
+            json={"policy_json": VALID_POLICY_JSON},
+        )
+        assert response.status_code == 500
+
+
+# ── Health & UI Endpoint Tests ────────────────────────────────────────────────
+
+class TestHealthEndpoint:
+    def test_health_returns_ok(self, client):
+        response = client.get("/api/v1/health")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
+
+class TestIndexEndpoint:
+    def test_index_returns_html(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+        assert "IAM Policy Explainer" in response.text
