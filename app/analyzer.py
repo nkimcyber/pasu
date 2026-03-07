@@ -11,7 +11,7 @@ import os
 import anthropic
 
 from app import aws_client
-from app.models import AnalysisResult, EscalationFinding, EscalationResult, ExplainResult
+from app.models import AnalysisResult, EscalationFinding, EscalationResult, ExplainResult, RuleFinding
 
 logger = logging.getLogger(__name__)
 
@@ -21,25 +21,343 @@ MAX_TOKENS = 4096
 # ── Risk action lists ─────────────────────────────────────────────────────────
 
 HIGH_RISK_ACTIONS: set[str] = {
+    # IAM privilege escalation
     "iam:passrole",
     "iam:createpolicyversion",
     "iam:setdefaultpolicyversion",
     "iam:attachrolepolicy",
     "iam:attachuserpolicy",
     "iam:attachgrouppolicy",
-    "iam:putuserolicy",
+    "iam:putuserpolicy",
     "iam:putrolepolicy",
     "iam:createrole",
     "iam:updateassumerolepolicy",
+    # S3 public exposure
+    "s3:putbucketpolicy",
+    "s3:putbucketacl",
+    "s3:putobjectacl",
+    # Arbitrary code execution
+    "lambda:createfunction",
+    "lambda:updatefunctioncode",
+    "ec2:runinstances",
+    # Org-level admin and data exfiltration
+    "organizations:*",
+    "kms:decrypt",
+    "kms:describekey",
 }
 
 MEDIUM_RISK_ACTIONS: set[str] = {
     "sts:assumerole",
     "iam:createaccesskey",
+    # Secret and config access
+    "secretsmanager:getsecretvalue",
+    "ssm:getparameter",
+    # Data exfiltration / reconnaissance
+    "rds:copydbsnapshot",
+    "ec2:describeinstances",
 }
 
 # Actions that are wildcards covering all IAM or all actions
 WILDCARD_PREFIXES: tuple[str, ...] = ("iam:*", "*")
+
+# Context-dependent medium risk: only flagged when paired with Resource: *
+_CONTEXT_MEDIUM: dict[str, str] = {
+    "s3:getobject": (
+        "Read access to all S3 objects across all buckets in the account."
+    ),
+    "dynamodb:scan": (
+        "Scan access to all DynamoDB tables, exposing all stored data."
+    ),
+}
+
+# Number of structural rules (Categories 1 and 3) not captured in action sets.
+# Exported so the CLI banner can include them in the total rule count.
+STRUCTURAL_RULE_COUNT: int = 5  # R001, R002, R005, R006, R007
+
+# Human-readable descriptions for known risky actions (used by analyze_policy_rules)
+_ACTION_DESCRIPTIONS: dict[str, str] = {
+    "iam:passrole": (
+        "Allows passing IAM roles to AWS services, enabling privilege escalation "
+        "to any role that can be passed."
+    ),
+    "iam:createpolicyversion": (
+        "Can create a new policy version with elevated permissions and set it as default."
+    ),
+    "iam:setdefaultpolicyversion": (
+        "Can activate a previously created permissive policy version."
+    ),
+    "iam:attachrolepolicy": "Can attach admin-level managed policies to any role.",
+    "iam:attachuserpolicy": "Can attach admin-level managed policies to any user.",
+    "iam:attachgrouppolicy": "Can attach admin-level managed policies to any group.",
+    "iam:putrolepolicy": "Can inject an inline policy granting elevated permissions to any role.",
+    "iam:createrole": "Can create roles with arbitrary permissions and assume them.",
+    "iam:updateassumerolepolicy": (
+        "Can modify a role's trust policy to allow any principal to assume it."
+    ),
+    "s3:putbucketpolicy": (
+        "Can overwrite a bucket policy to make it publicly accessible or grant "
+        "cross-account access."
+    ),
+    "s3:putbucketacl": "Can change a bucket's ACL to make it publicly readable or writable.",
+    "s3:putobjectacl": "Can expose individual S3 objects to the public by modifying their ACLs.",
+    "lambda:createfunction": (
+        "Can deploy arbitrary code as a Lambda function with any specified execution role."
+    ),
+    "lambda:updatefunctioncode": (
+        "Can replace the code of a running Lambda function with arbitrary code."
+    ),
+    "ec2:runinstances": (
+        "Can launch EC2 instances with a specified IAM role, executing code with that "
+        "role's permissions."
+    ),
+    "organizations:*": (
+        "Grants full control over the AWS Organization, including creating and "
+        "managing member accounts."
+    ),
+    "kms:decrypt": (
+        "Can decrypt any data encrypted under accessible KMS keys, enabling data exfiltration."
+    ),
+    "kms:describekey": (
+        "Can enumerate KMS key metadata, useful for identifying encryption keys to target."
+    ),
+    "sts:assumerole": (
+        "Can assume IAM roles, potentially gaining permissions beyond the current principal."
+    ),
+    "iam:createaccesskey": "Can create persistent access key credentials for any IAM user.",
+    "secretsmanager:getsecretvalue": (
+        "Can retrieve any secret value from AWS Secrets Manager, including credentials."
+    ),
+    "ssm:getparameter": (
+        "Can read any SSM parameter, including SecureString parameters containing secrets."
+    ),
+    "rds:copydbsnapshot": (
+        "Can copy RDS snapshots to another account, potentially exfiltrating database contents."
+    ),
+    "ec2:describeinstances": (
+        "Enables discovery of all EC2 instances in the account, facilitating reconnaissance."
+    ),
+}
+
+# ── Plain-English lookup tables (used by explain_policy_local) ────────────────
+
+SERVICE_DESCRIPTIONS: dict[str, str] = {
+    "s3": "S3 (file storage)",
+    "ec2": "EC2 (virtual servers)",
+    "iam": "IAM (user permissions)",
+    "lambda": "Lambda (serverless functions)",
+    "rds": "RDS (databases)",
+    "dynamodb": "DynamoDB (NoSQL database)",
+    "kms": "KMS (encryption keys)",
+    "secretsmanager": "Secrets Manager",
+    "ssm": "Systems Manager Parameter Store",
+    "sts": "STS (temporary credentials)",
+    "organizations": "AWS Organizations (account management)",
+    "cloudwatch": "CloudWatch (monitoring)",
+    "logs": "CloudWatch Logs",
+    "sns": "SNS (notifications)",
+    "sqs": "SQS (message queues)",
+    "cloudformation": "CloudFormation (infrastructure)",
+}
+
+# Gerund phrases for common IAM actions — lowercase, used directly in sentences.
+# Both Allow ("ALLOWS reading files...") and Deny ("BLOCKS reading files...") use these.
+ACTION_DESCRIPTIONS: dict[str, str] = {
+    "s3:getobject": "read files from storage",
+    "s3:putobject": "upload files to storage",
+    "s3:deleteobject": "delete files from storage",
+    "s3:listbucket": "list files in a bucket",
+    "s3:deletebucket": "delete storage buckets",
+    "s3:createbucket": "create storage buckets",
+    "s3:putbucketpolicy": "change bucket security policy",
+    "s3:putbucketacl": "change bucket access controls",
+    "s3:putobjectacl": "change file access controls",
+    "ec2:runinstances": "start virtual servers",
+    "ec2:terminateinstances": "shut down virtual servers",
+    "ec2:stopinstances": "stop virtual servers",
+    "ec2:startinstances": "restart virtual servers",
+    "ec2:describeinstances": "view virtual server details",
+    "iam:passrole": "assign roles to AWS services",
+    "iam:createuser": "create new users",
+    "iam:deleteuser": "delete users",
+    "iam:attachrolepolicy": "attach permission policies to roles",
+    "iam:attachuserpolicy": "attach permission policies to users",
+    "iam:attachgrouppolicy": "attach permission policies to groups",
+    "iam:createpolicyversion": "create new versions of permission policies",
+    "iam:setdefaultpolicyversion": "activate a different version of a permission policy",
+    "iam:createrole": "create roles",
+    "iam:putuserpolicy": "write inline permission policies for users",
+    "iam:putrolepolicy": "write inline permission policies for roles",
+    "iam:updateassumerolepolicy": "modify role trust policies",
+    "lambda:invokefunction": "run serverless functions",
+    "lambda:createfunction": "create serverless functions",
+    "lambda:updatefunctioncode": "modify serverless function code",
+    "lambda:deletefunction": "delete serverless functions",
+    "sts:assumerole": "switch to another role",
+    "kms:decrypt": "decrypt data using encryption keys",
+    "kms:encrypt": "encrypt data",
+    "kms:describekey": "inspect encryption key details",
+    "kms:createkey": "create encryption keys",
+    "secretsmanager:getsecretvalue": "retrieve stored secrets",
+    "secretsmanager:createsecret": "create secrets",
+    "secretsmanager:deletesecret": "delete secrets",
+    "ssm:getparameter": "retrieve stored parameters",
+    "ssm:putparameter": "write configuration parameters",
+    "rds:copydbsnapshot": "copy database snapshots",
+    "rds:createdbsnapshot": "create database snapshots",
+    "rds:deletedbinstance": "delete databases",
+    "dynamodb:scan": "read all data from a NoSQL table",
+    "dynamodb:getitem": "read items from a NoSQL table",
+    "dynamodb:putitem": "write items to a NoSQL table",
+    "dynamodb:deleteitem": "delete items from a NoSQL table",
+    "dynamodb:query": "query data in a NoSQL table",
+    "organizations:*": "manage the entire AWS Organization",
+}
+
+
+# ── Plain-English helpers ──────────────────────────────────────────────────────
+
+import re as _re
+
+
+def _action_phrase(action: str) -> str:
+    """Return a lowercase gerund phrase for one IAM action.
+
+    Examples:
+        "*"                        → "full administrator access to ALL AWS services"
+        "iam:*"                    → "ALL actions in IAM (user permissions)"
+        "ec2:*"                    → "ALL actions in EC2 (virtual servers)"
+        "s3:GetObject"             → "read files from storage"
+        "ec2:DescribeSecurityGroups" → "describe security groups in EC2 (virtual servers)"
+    """
+    al = action.lower()
+    if al == "*":
+        return "full administrator access to ALL AWS services"
+    if al == "iam:*":
+        return "ALL actions in IAM (user permissions)"
+    if al.endswith(":*"):
+        svc = al.split(":")[0]
+        svc_label = SERVICE_DESCRIPTIONS.get(svc, svc.upper())
+        return f"ALL actions in {svc_label}"
+    if al in ACTION_DESCRIPTIONS:
+        return ACTION_DESCRIPTIONS[al]
+    # Auto-generate from CamelCase: "ec2:DescribeSecurityGroups" → "describe security groups in EC2 (virtual servers)"
+    parts = action.split(":")
+    if len(parts) == 2:
+        svc, op = parts
+        words = _re.sub(r"(?<=[a-z])(?=[A-Z])", " ", op).lower()
+        svc_label = SERVICE_DESCRIPTIONS.get(svc.lower(), svc.upper())
+        return f"{words} in {svc_label}"
+    return action.lower()
+
+
+def _actions_phrase(actions: list[str]) -> str:
+    """Combine IAM actions into a concise human-readable gerund phrase."""
+    if not actions:
+        return "perform unspecified actions"
+    if "*" in [a.lower() for a in actions]:
+        return "full administrator access to ALL AWS services"
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for a in actions[:5]:
+        p = _action_phrase(a)
+        if p not in seen:
+            seen.add(p)
+            phrases.append(p)
+    suffix = f", and {len(actions) - 5} more action(s)" if len(actions) > 5 else ""
+    if len(phrases) == 1:
+        return phrases[0] + suffix
+    return ", ".join(phrases[:-1]) + f", and {phrases[-1]}" + suffix
+
+
+def _resource_phrase(resources: list[str]) -> tuple[str, bool]:
+    """Convert resource ARNs to a readable phrase.
+
+    Returns:
+        (phrase, is_wildcard) — is_wildcard is True when Resource is "*".
+    """
+    if not resources or "*" in resources:
+        return "all resources", True
+    descriptions: list[str] = []
+    for res in resources[:3]:
+        if res.startswith("arn:aws:s3:::"):
+            path = res[len("arn:aws:s3:::"):]
+            bucket = path.split("/")[0]
+            if bucket == "*":
+                descriptions.append("all S3 buckets")
+            else:
+                descriptions.append(f"the S3 bucket '{bucket}'")
+        elif res.startswith("arn:aws:"):
+            parts = res.split(":")
+            if len(parts) >= 6:
+                svc = parts[2]
+                resource_part = ":".join(parts[5:])
+                name = resource_part.split("/")[-1]
+                svc_label = SERVICE_DESCRIPTIONS.get(svc, svc.upper()).split(" ")[0]
+                if name and name != "*":
+                    descriptions.append(f"the {svc_label} resource '{name}'")
+                else:
+                    descriptions.append(f"all {svc_label} resources")
+            else:
+                descriptions.append(res)
+        else:
+            descriptions.append(res)
+    if len(resources) > 3:
+        descriptions.append(f"and {len(resources) - 3} more")
+    return ", ".join(descriptions), False
+
+
+def _explain_statement(stmt: dict) -> str:
+    """Generate an 'ALLOWS/BLOCKS ...' sentence for one IAM policy statement."""
+    effect = stmt.get("Effect", "Allow")
+    has_not_action = "NotAction" in stmt
+    has_not_resource = "NotResource" in stmt
+
+    raw_actions = stmt.get("NotAction" if has_not_action else "Action", [])
+    if isinstance(raw_actions, str):
+        raw_actions = [raw_actions]
+
+    raw_resources = stmt.get("NotResource" if has_not_resource else "Resource", [])
+    if isinstance(raw_resources, str):
+        raw_resources = [raw_resources]
+
+    actions_lower = [a.lower() for a in raw_actions]
+    is_full_wildcard = "*" in actions_lower and not has_not_action
+    is_wildcard_resource = "*" in raw_resources and not has_not_resource
+
+    # Full administrator access shortcut
+    if effect == "Allow" and is_full_wildcard and is_wildcard_resource:
+        return (
+            "ALLOWS full administrator access to ALL AWS services and ALL resources. "
+            "This is extremely dangerous."
+        )
+
+    # Build action phrase
+    if has_not_action:
+        action_str = f"ALL actions EXCEPT: {_actions_phrase(raw_actions)}"
+    else:
+        action_str = _actions_phrase(raw_actions)
+
+    # Build resource phrase
+    if has_not_resource:
+        resource_str = f"everything EXCEPT {_resource_phrase(raw_resources)[0]}"
+        is_wild = False
+    else:
+        resource_str, is_wild = _resource_phrase(raw_resources)
+
+    if effect == "Allow":
+        connector = "on" if is_wild else "limited to"
+        return f"ALLOWS {action_str}, {connector} {resource_str}."
+    else:  # Deny
+        # Append service label when there is exactly one service involved
+        if not has_not_action:
+            services = {a.split(":")[0].lower() for a in raw_actions if ":" in a}
+            if len(services) == 1:
+                svc = next(iter(services))
+                svc_label = SERVICE_DESCRIPTIONS.get(svc, "")
+                if svc_label:
+                    return f"BLOCKS {action_str} from {svc_label}, on {resource_str}."
+        return f"BLOCKS {action_str} on {resource_str}."
+
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -210,6 +528,179 @@ def _detect_risky_actions(allowed_actions: set[str]) -> tuple[list[str], str]:
 
 # ── Local (no-API) Functions ──────────────────────────────────────────────────
 
+def analyze_policy_rules(policy_json: str) -> list[RuleFinding]:
+    """Run all local rule categories against a policy and return findings.
+
+    Three categories of rules are evaluated:
+      Category 1 — Overly permissive resource patterns (R001, R002)
+      Category 2 — Dangerous service actions, including context-aware checks (R003, R004)
+      Category 3 — Missing Deny / Condition checks (R005, R006, R007)
+
+    No Claude API call is made. This function works entirely offline.
+
+    Args:
+        policy_json: Raw IAM policy JSON string.
+
+    Returns:
+        List of RuleFinding objects, one per detected issue across all statements.
+
+    Raises:
+        ValueError: If policy_json is not valid JSON or not a valid IAM policy.
+    """
+    try:
+        parsed = json.loads(policy_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Invalid JSON provided.") from exc
+
+    validate_iam_policy(parsed)
+
+    findings: list[RuleFinding] = []
+
+    for i, stmt in enumerate(parsed["Statement"]):
+        effect = stmt.get("Effect")
+        has_not_action = "NotAction" in stmt
+        has_not_resource = "NotResource" in stmt
+
+        # ── Category 3 (partial): NotAction / NotResource on any Allow ────────
+        if effect == "Allow":
+            if has_not_action:
+                findings.append(RuleFinding(
+                    rule_id="R006",
+                    severity="high",
+                    title="Inverse action grant - allows everything EXCEPT listed actions",
+                    description=(
+                        "NotAction grants access to all AWS actions except those listed. "
+                        "This is almost always overly permissive and difficult to audit."
+                    ),
+                    statement_index=i,
+                ))
+            if has_not_resource:
+                findings.append(RuleFinding(
+                    rule_id="R007",
+                    severity="high",
+                    title="Inverse resource grant - allows access to everything EXCEPT listed resources",
+                    description=(
+                        "NotResource grants access to all resources except those listed. "
+                        "This is almost always overly permissive and difficult to audit."
+                    ),
+                    statement_index=i,
+                ))
+
+        # Categories 1 and 2 require Effect=Allow with a plain Action list
+        if effect != "Allow" or has_not_action:
+            continue
+
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        actions_lower_set = {a.lower() for a in actions}
+
+        resources = stmt.get("Resource", [])
+        if isinstance(resources, str):
+            resources = [resources]
+        resources_set = set(resources)
+
+        condition = stmt.get("Condition")
+        has_full_wildcard = "*" in actions_lower_set
+        has_unrestricted_resource = "*" in resources_set
+
+        # ── Category 1: Overly permissive resource patterns ───────────────────
+
+        # R001: Resource: * with any action
+        if has_unrestricted_resource:
+            findings.append(RuleFinding(
+                rule_id="R001",
+                severity="high",
+                title="Unrestricted resource access",
+                description=(
+                    "This statement allows actions on all resources ('*'). "
+                    "Restrict to specific ARNs to follow least privilege."
+                ),
+                statement_index=i,
+            ))
+
+        # R002: Access to all S3 buckets via broad ARN patterns
+        _S3_ALL = {"arn:aws:s3:::*", "arn:aws:s3:::*/*"}
+        if resources_set & _S3_ALL:
+            findings.append(RuleFinding(
+                rule_id="R002",
+                severity="high",
+                title="Access to all S3 buckets",
+                description=(
+                    "This statement grants access to all S3 buckets. "
+                    "Restrict to specific bucket ARNs."
+                ),
+                statement_index=i,
+            ))
+
+        # ── Category 2: Dangerous service actions ─────────────────────────────
+
+        matched_high = HIGH_RISK_ACTIONS.copy() if has_full_wildcard else (
+            actions_lower_set & HIGH_RISK_ACTIONS
+        )
+        matched_medium = MEDIUM_RISK_ACTIONS.copy() if has_full_wildcard else (
+            actions_lower_set & MEDIUM_RISK_ACTIONS
+        )
+
+        for action in sorted(matched_high):
+            findings.append(RuleFinding(
+                rule_id="R003",
+                severity="high",
+                title=f"Dangerous action: {action}",
+                description=_ACTION_DESCRIPTIONS.get(
+                    action,
+                    f"The action '{action}' can be used for privilege escalation.",
+                ),
+                statement_index=i,
+            ))
+
+        for action in sorted(matched_medium):
+            findings.append(RuleFinding(
+                rule_id="R004",
+                severity="medium",
+                title=f"Sensitive action: {action}",
+                description=_ACTION_DESCRIPTIONS.get(
+                    action,
+                    f"The action '{action}' grants access to sensitive data or capabilities.",
+                ),
+                statement_index=i,
+            ))
+
+        # Context-dependent medium risk: only flagged when Resource is unrestricted
+        if has_unrestricted_resource or has_full_wildcard:
+            for action_lower in sorted(actions_lower_set):
+                if action_lower in _CONTEXT_MEDIUM:
+                    findings.append(RuleFinding(
+                        rule_id="R004",
+                        severity="medium",
+                        title=f"Broad data access: {action_lower} on all resources",
+                        description=_CONTEXT_MEDIUM[action_lower],
+                        statement_index=i,
+                    ))
+
+        # ── Category 3: Missing Deny / Condition checks ───────────────────────
+
+        # R005: Sensitive actions without a Condition block
+        has_sensitive = bool(matched_high or matched_medium) or (
+            has_unrestricted_resource
+            and any(a in _CONTEXT_MEDIUM for a in actions_lower_set)
+        )
+        if has_sensitive and not condition:
+            findings.append(RuleFinding(
+                rule_id="R005",
+                severity="medium",
+                title="No conditions restrict this permission",
+                description=(
+                    "Sensitive actions are allowed without any Condition block. "
+                    "Add conditions such as aws:RequestedRegion or aws:PrincipalAccount "
+                    "to limit the scope of this permission."
+                ),
+                statement_index=i,
+            ))
+
+    return findings
+
+
 def explain_policy_local(policy_json: str) -> ExplainResult:
     """Generate a rule-based plain-English explanation with no Claude API call.
 
@@ -229,66 +720,29 @@ def explain_policy_local(policy_json: str) -> ExplainResult:
 
     validate_iam_policy(parsed)
 
-    details: list[str] = []
-    has_allow_all = False
+    details = [_explain_statement(stmt) for stmt in parsed["Statement"]]
 
-    for stmt in parsed["Statement"]:
-        effect = stmt.get("Effect", "Allow")
-        actions = stmt.get("Action", [])
-        if isinstance(actions, str):
-            actions = [actions]
-        resources = stmt.get("Resource", [])
-        if isinstance(resources, str):
-            resources = [resources]
+    has_full_admin = any(
+        stmt.get("Effect") == "Allow"
+        and stmt.get("Action") in ("*", ["*"])
+        and stmt.get("Resource") in ("*", ["*"])
+        for stmt in parsed["Statement"]
+    )
 
-        all_actions = "*" in actions
-        all_resources = "*" in resources
-
-        if effect == "Allow" and all_actions and all_resources:
-            has_allow_all = True
-            details.append(
-                "Allows full access to all AWS services and all resources "
-                "(administrator-level access)."
-            )
-        elif effect == "Allow" and all_actions:
-            resource_desc = ", ".join(resources[:3])
-            details.append(f"Allows all AWS actions on: {resource_desc}.")
-        elif effect == "Allow":
-            services = sorted({a.split(":")[0] for a in actions if ":" in a})
-            resource_desc = "all resources" if all_resources else ", ".join(resources[:2])
-            if services:
-                details.append(
-                    f"Allows {', '.join(services)} actions on {resource_desc}."
-                )
-            else:
-                details.append(
-                    f"Allows {', '.join(actions[:3])} on {resource_desc}."
-                )
-        else:  # Deny
-            services = sorted({a.split(":")[0] for a in actions if ":" in a})
-            if all_actions and all_resources:
-                details.append("Explicitly denies all AWS actions on all resources.")
-            elif services:
-                details.append(f"Explicitly denies {', '.join(services)} actions.")
-            else:
-                details.append(f"Explicitly denies: {', '.join(actions[:3])}.")
-
-    if has_allow_all:
+    if has_full_admin:
         summary = (
-            "This policy grants full administrator-level access to all AWS "
-            "services and resources."
+            "This policy grants FULL ADMIN ACCESS to every AWS service and "
+            "resource in the account. This is extremely dangerous."
         )
     elif len(details) == 1:
         summary = details[0]
     else:
         effects = {s.get("Effect") for s in parsed["Statement"]}
         if effects == {"Allow"}:
-            summary = (
-                f"This policy allows access across {len(details)} statement(s)."
-            )
+            summary = f"This policy allows access across {len(details)} permission(s)."
         else:
             summary = (
-                f"This policy has {len(details)} statement(s) with mixed "
+                f"This policy has {len(details)} permission(s) with mixed "
                 "Allow/Deny effects."
             )
 
@@ -298,11 +752,15 @@ def explain_policy_local(policy_json: str) -> ExplainResult:
 def escalate_policy_local(policy_json: str) -> EscalationResult:
     """Run local rule-based privilege escalation detection with no Claude API call.
 
+    Combines action-list matching (_detect_risky_actions) with the full structural
+    rule engine (analyze_policy_rules) to produce a richer risk assessment.
+
     Args:
         policy_json: Raw IAM policy JSON string.
 
     Returns:
-        EscalationResult with risk level and detected actions; findings is always [].
+        EscalationResult with risk level and detected actions; findings is always []
+        because detailed per-finding analysis requires the --ai flag.
 
     Raises:
         ValueError: If policy_json is not valid JSON or not a valid IAM policy.
@@ -314,20 +772,43 @@ def escalate_policy_local(policy_json: str) -> EscalationResult:
 
     validate_iam_policy(parsed)
 
+    # Action-based detection — drives detected_actions and backward-compat risk level
     allowed_actions = _extract_allowed_actions(parsed)
-    detected, risk_level = _detect_risky_actions(allowed_actions)
+    detected, action_risk_level = _detect_risky_actions(allowed_actions)
 
-    if not detected:
+    # Structural rule engine — all three categories
+    rule_findings = analyze_policy_rules(policy_json)
+
+    # Derive risk level from rule findings
+    _rank = {"Low": 0, "Medium": 1, "High": 2}
+    rules_risk_level = "Low"
+    for f in rule_findings:
+        if f.severity == "high":
+            rules_risk_level = "High"
+            break
+        if f.severity == "medium":
+            rules_risk_level = "Medium"
+
+    risk_level = (
+        action_risk_level
+        if _rank[action_risk_level] >= _rank[rules_risk_level]
+        else rules_risk_level
+    )
+
+    n_rules = len(rule_findings)
+    rule_note = f", {n_rules} rule finding(s) total" if rule_findings else ""
+
+    if not detected and not rule_findings:
         summary = "No privilege escalation risks detected in this policy."
     elif risk_level == "High":
         summary = (
-            f"High privilege escalation risk: {len(detected)} dangerous action(s) "
-            "detected. Run with --ai for detailed analysis."
+            f"High privilege escalation risk: {len(detected)} dangerous action(s) detected"
+            f"{rule_note}. Run with --ai for detailed analysis."
         )
     else:
         summary = (
-            f"Medium privilege escalation risk: {len(detected)} sensitive action(s) "
-            "detected. Run with --ai for detailed analysis."
+            f"Medium privilege escalation risk: {len(detected)} sensitive action(s) detected"
+            f"{rule_note}. Run with --ai for detailed analysis."
         )
 
     return EscalationResult(

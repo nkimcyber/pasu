@@ -50,6 +50,16 @@ class ExplainResult(BaseModel):
     status: str = Field(default="ok")
 
 
+class RuleFinding(BaseModel):
+    """A single finding produced by the local rule engine (analyze_policy_rules)."""
+
+    rule_id: str = Field(..., description="Identifier for the rule that fired (e.g. R001).")
+    severity: str = Field(..., description="Severity level: 'high', 'medium', or 'low'.")
+    title: str = Field(..., description="Short description of the finding.")
+    description: str = Field(..., description="Detailed explanation and remediation hint.")
+    statement_index: int = Field(..., description="Zero-based index of the offending Statement.")
+
+
 class EscalationFinding(BaseModel):
     """A single detected privilege escalation finding."""
 

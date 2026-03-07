@@ -627,3 +627,563 @@ class TestEscalateEndpoint:
             json={"policy_json": RISKY_POLICY_JSON},
         )
         assert response.status_code == 500
+
+
+# ── analyze_policy_rules Tests ────────────────────────────────────────────────
+#
+# Shared policy helpers
+
+def _make_policy(effect, action, resource, condition=None, use_not_action=False,
+                 use_not_resource=False):
+    """Build a minimal IAM policy JSON string for testing."""
+    stmt = {"Effect": effect}
+    if use_not_action:
+        stmt["NotAction"] = action if isinstance(action, list) else [action]
+    else:
+        stmt["Action"] = action
+    if use_not_resource:
+        stmt["NotResource"] = resource if isinstance(resource, list) else [resource]
+    else:
+        stmt["Resource"] = resource
+    if condition:
+        stmt["Condition"] = condition
+    return json.dumps({"Version": "2012-10-17", "Statement": [stmt]})
+
+
+class TestAnalyzePolicyRulesCategory1:
+    """Category 1 — Overly Permissive Resource Patterns."""
+
+    def test_resource_wildcard_raises_r001(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:ListBuckets", "*")
+        findings = analyze_policy_rules(policy)
+        rule_ids = [f.rule_id for f in findings]
+        assert "R001" in rule_ids
+        r001 = next(f for f in findings if f.rule_id == "R001")
+        assert r001.severity == "high"
+        assert r001.statement_index == 0
+
+    def test_specific_resource_does_not_raise_r001(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:GetObject", "arn:aws:s3:::my-bucket/*")
+        findings = analyze_policy_rules(policy)
+        assert not any(f.rule_id == "R001" for f in findings)
+
+    def test_s3_all_buckets_arn_raises_r002(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:GetObject", "arn:aws:s3:::*")
+        findings = analyze_policy_rules(policy)
+        rule_ids = [f.rule_id for f in findings]
+        assert "R002" in rule_ids
+        r002 = next(f for f in findings if f.rule_id == "R002")
+        assert r002.severity == "high"
+
+    def test_s3_all_objects_arn_raises_r002(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:GetObject", "arn:aws:s3:::*/*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R002" for f in findings)
+
+    def test_specific_s3_bucket_does_not_raise_r002(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:GetObject", "arn:aws:s3:::my-bucket/*")
+        findings = analyze_policy_rules(policy)
+        assert not any(f.rule_id == "R002" for f in findings)
+
+    def test_deny_statement_with_wildcard_resource_skips_r001(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Deny", "s3:DeleteObject", "*")
+        findings = analyze_policy_rules(policy)
+        assert not any(f.rule_id == "R001" for f in findings)
+
+
+class TestAnalyzePolicyRulesCategory2:
+    """Category 2 — Dangerous Service Actions."""
+
+    def test_s3_putbucketpolicy_raises_r003_high(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:PutBucketPolicy", "arn:aws:s3:::my-bucket")
+        findings = analyze_policy_rules(policy)
+        r003 = [f for f in findings if f.rule_id == "R003"]
+        assert any("s3:putbucketpolicy" in f.title for f in r003)
+        assert all(f.severity == "high" for f in r003)
+
+    def test_lambda_updatefunctioncode_raises_r003_high(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "lambda:UpdateFunctionCode", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(
+            f.rule_id == "R003" and "lambda:updatefunctioncode" in f.title
+            for f in findings
+        )
+
+    def test_secretsmanager_raises_r004_medium(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "secretsmanager:GetSecretValue",
+                              "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret")
+        findings = analyze_policy_rules(policy)
+        r004 = [f for f in findings if f.rule_id == "R004"]
+        assert any("secretsmanager:getsecretvalue" in f.title for f in r004)
+        assert all(f.severity == "medium" for f in r004)
+
+    def test_ssm_getparameter_raises_r004_medium(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "ssm:GetParameter", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(
+            f.rule_id == "R004" and "ssm:getparameter" in f.title
+            for f in findings
+        )
+
+    def test_s3_getobject_with_wildcard_resource_raises_r004(self):
+        """s3:GetObject is only flagged when Resource is *."""
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:GetObject", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(
+            f.rule_id == "R004" and "s3:getobject" in f.title
+            for f in findings
+        )
+
+    def test_s3_getobject_with_specific_resource_not_flagged(self):
+        """s3:GetObject on a specific ARN must not produce a medium finding."""
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:GetObject", "arn:aws:s3:::my-bucket/*")
+        findings = analyze_policy_rules(policy)
+        assert not any(
+            f.rule_id == "R004" and "s3:getobject" in f.title
+            for f in findings
+        )
+
+    def test_dynamodb_scan_with_wildcard_resource_raises_r004(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "dynamodb:Scan", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(
+            f.rule_id == "R004" and "dynamodb:scan" in f.title
+            for f in findings
+        )
+
+    def test_wildcard_action_flags_all_high_risk(self):
+        from app.analyzer import analyze_policy_rules, HIGH_RISK_ACTIONS
+        policy = _make_policy("Allow", "*", "*")
+        findings = analyze_policy_rules(policy)
+        found_actions = {f.title.split(": ", 1)[1] for f in findings if f.rule_id == "R003"}
+        assert found_actions == HIGH_RISK_ACTIONS
+
+    def test_organizations_wildcard_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "organizations:*", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(
+            f.rule_id == "R003" and "organizations:*" in f.title
+            for f in findings
+        )
+
+
+class TestAnalyzePolicyRulesCategory3:
+    """Category 3 — Missing Deny / Condition Checks."""
+
+    def test_sensitive_action_without_condition_raises_r005(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "iam:PassRole", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R005" for f in findings)
+        r005 = next(f for f in findings if f.rule_id == "R005")
+        assert r005.severity == "medium"
+
+    def test_sensitive_action_with_condition_does_not_raise_r005(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy(
+            "Allow", "iam:PassRole", "*",
+            condition={"StringEquals": {"aws:RequestedRegion": "us-east-1"}},
+        )
+        findings = analyze_policy_rules(policy)
+        assert not any(f.rule_id == "R005" for f in findings)
+
+    def test_safe_action_without_condition_does_not_raise_r005(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:GetObject", "arn:aws:s3:::my-bucket/*")
+        findings = analyze_policy_rules(policy)
+        assert not any(f.rule_id == "R005" for f in findings)
+
+    def test_not_action_on_allow_raises_r006(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", ["s3:DeleteObject"], "*", use_not_action=True)
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R006" for f in findings)
+        r006 = next(f for f in findings if f.rule_id == "R006")
+        assert r006.severity == "high"
+
+    def test_not_action_on_deny_does_not_raise_r006(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Deny", ["s3:DeleteObject"], "*", use_not_action=True)
+        findings = analyze_policy_rules(policy)
+        assert not any(f.rule_id == "R006" for f in findings)
+
+    def test_not_resource_on_allow_raises_r007(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy(
+            "Allow", "s3:GetObject", "arn:aws:s3:::protected-bucket/*",
+            use_not_resource=True,
+        )
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R007" for f in findings)
+        r007 = next(f for f in findings if f.rule_id == "R007")
+        assert r007.severity == "high"
+
+    def test_not_resource_on_deny_does_not_raise_r007(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy(
+            "Deny", "s3:GetObject", "arn:aws:s3:::protected-bucket/*",
+            use_not_resource=True,
+        )
+        findings = analyze_policy_rules(policy)
+        assert not any(f.rule_id == "R007" for f in findings)
+
+
+class TestAnalyzePolicyRulesGeneral:
+    """Cross-cutting tests for analyze_policy_rules."""
+
+    def test_invalid_json_raises_value_error(self):
+        from app.analyzer import analyze_policy_rules
+        with pytest.raises(ValueError, match="Invalid JSON"):
+            analyze_policy_rules("not json")
+
+    def test_non_iam_json_raises_value_error(self):
+        from app.analyzer import analyze_policy_rules
+        with pytest.raises(ValueError):
+            analyze_policy_rules(json.dumps({"foo": "bar"}))
+
+    def test_fully_safe_policy_returns_no_findings(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:GetObject", "arn:aws:s3:::my-bucket/prefix/*")
+        findings = analyze_policy_rules(policy)
+        assert findings == []
+
+    def test_finding_has_correct_statement_index(self):
+        from app.analyzer import analyze_policy_rules
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "s3:GetObject",
+                 "Resource": "arn:aws:s3:::safe-bucket/*"},
+                {"Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
+            ],
+        })
+        findings = analyze_policy_rules(policy)
+        risky = [f for f in findings if f.rule_id in ("R001", "R003", "R005")]
+        assert all(f.statement_index == 1 for f in risky)
+
+    def test_rule_finding_model_fields(self):
+        from app.analyzer import analyze_policy_rules
+        from app.models import RuleFinding
+        policy = _make_policy("Allow", "iam:PassRole", "*")
+        findings = analyze_policy_rules(policy)
+        assert all(isinstance(f, RuleFinding) for f in findings)
+        for f in findings:
+            assert f.rule_id
+            assert f.severity in ("high", "medium", "low")
+            assert f.title
+            assert f.description
+            assert isinstance(f.statement_index, int)
+
+
+# ── Task 1 extended action coverage tests ─────────────────────────────────────
+
+class TestAnalyzePolicyRulesNewHighRiskActions:
+    """Test the expanded HIGH_RISK_ACTIONS entries (Category 2 / R003)."""
+
+    def test_kms_decrypt_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "kms:Decrypt", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "kms:decrypt" in f.title for f in findings)
+
+    def test_kms_describekey_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "kms:DescribeKey", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "kms:describekey" in f.title for f in findings)
+
+    def test_lambda_createfunction_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "lambda:CreateFunction", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "lambda:createfunction" in f.title for f in findings)
+
+    def test_ec2_runinstances_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "ec2:RunInstances", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "ec2:runinstances" in f.title for f in findings)
+
+    def test_s3_putbucketacl_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:PutBucketAcl", "arn:aws:s3:::my-bucket")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "s3:putbucketacl" in f.title for f in findings)
+
+    def test_s3_putobjectacl_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "s3:PutObjectAcl", "arn:aws:s3:::my-bucket/*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "s3:putobjectacl" in f.title for f in findings)
+
+    def test_iam_updateassumerolepolicy_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "iam:UpdateAssumeRolePolicy", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "iam:updateassumerolepolicy" in f.title for f in findings)
+
+    def test_iam_setdefaultpolicyversion_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "iam:SetDefaultPolicyVersion", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "iam:setdefaultpolicyversion" in f.title for f in findings)
+
+    def test_iam_createrole_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "iam:CreateRole", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "iam:createrole" in f.title for f in findings)
+
+    def test_iam_createpolicyversion_raises_r003(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "iam:CreatePolicyVersion", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R003" and "iam:createpolicyversion" in f.title for f in findings)
+
+
+class TestAnalyzePolicyRulesNewMediumRiskActions:
+    """Test the expanded MEDIUM_RISK_ACTIONS entries (Category 2 / R004)."""
+
+    def test_rds_copydbsnapshot_raises_r004(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "rds:CopyDBSnapshot", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R004" and "rds:copydbsnapshot" in f.title for f in findings)
+
+    def test_ec2_describeinstances_raises_r004(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "ec2:DescribeInstances", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R004" and "ec2:describeinstances" in f.title for f in findings)
+
+    def test_iam_createaccesskey_raises_r004(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "iam:CreateAccessKey", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R004" and "iam:createaccesskey" in f.title for f in findings)
+
+    def test_sts_assumerole_raises_r004(self):
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "sts:AssumeRole", "*")
+        findings = analyze_policy_rules(policy)
+        assert any(f.rule_id == "R004" and "sts:assumerole" in f.title for f in findings)
+
+    def test_r003_finding_has_description(self):
+        """R003 findings for known actions must include a non-empty description."""
+        from app.analyzer import analyze_policy_rules
+        policy = _make_policy("Allow", "kms:Decrypt", "*")
+        findings = analyze_policy_rules(policy)
+        r003 = next(f for f in findings if f.rule_id == "R003" and "kms:decrypt" in f.title)
+        assert len(r003.description) > 20
+
+
+# ── Task 2: explain_policy_local improved output tests ────────────────────────
+
+class TestExplainPolicyLocal:
+    """Tests for the human-readable explain_policy_local() rewrite."""
+
+    def test_full_admin_policy_uses_allows_prefix(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+        })
+        result = explain_policy_local(policy)
+        assert "ALLOWS" in result.details[0]
+        assert "full administrator access" in result.details[0]
+        assert "extremely dangerous" in result.details[0]
+
+    def test_full_admin_summary_warns_about_danger(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+        })
+        result = explain_policy_local(policy)
+        assert "FULL ADMIN ACCESS" in result.summary or "full administrator" in result.summary.lower()
+
+    def test_s3_bucket_name_extracted_in_detail(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::my-special-bucket/*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        assert "my-special-bucket" in result.details[0]
+
+    def test_allow_uses_allows_prefix(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::my-bucket/*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        assert result.details[0].startswith("ALLOWS")
+
+    def test_allow_specific_resource_uses_limited_to(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::my-bucket/*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        assert "limited to" in result.details[0]
+
+    def test_deny_statement_uses_blocks_prefix(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Action": "s3:DeleteObject",
+                "Resource": "*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        assert result.details[0].startswith("BLOCKS")
+
+    def test_deny_includes_service_label(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Action": "s3:DeleteObject",
+                "Resource": "*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        # Service label should appear for single-service Deny
+        assert "S3" in result.details[0] or "storage" in result.details[0]
+
+    def test_wildcard_resource_uses_on_all_resources(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "kms:Decrypt",
+                "Resource": "*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        assert "on all resources" in result.details[0]
+
+    def test_known_action_uses_action_descriptions_phrase(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": "*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        assert "retrieve stored secrets" in result.details[0]
+
+    def test_multi_action_verbs_combined(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:PutObject"],
+                "Resource": "arn:aws:s3:::my-bucket/*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        detail = result.details[0]
+        assert "read files from storage" in detail or "upload files to storage" in detail
+
+    def test_unknown_action_camelcase_fallback(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "ec2:DescribeSecurityGroups",
+                "Resource": "*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        detail = result.details[0].lower()
+        assert "describe" in detail and "security groups" in detail
+
+    def test_service_wildcard_phrase(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "iam:*",
+                "Resource": "*",
+            }],
+        })
+        result = explain_policy_local(policy)
+        assert "ALL actions in IAM" in result.details[0]
+
+    def test_multi_statement_allow_only_summary(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "s3:GetObject",
+                 "Resource": "arn:aws:s3:::bucket-a/*"},
+                {"Effect": "Allow", "Action": "s3:PutObject",
+                 "Resource": "arn:aws:s3:::bucket-b/*"},
+            ],
+        })
+        result = explain_policy_local(policy)
+        assert "2" in result.summary
+        assert len(result.details) == 2
+
+    def test_mixed_allow_deny_summary(self):
+        from app.analyzer import explain_policy_local
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "s3:GetObject",
+                 "Resource": "arn:aws:s3:::my-bucket/*"},
+                {"Effect": "Deny", "Action": "s3:DeleteObject",
+                 "Resource": "*"},
+            ],
+        })
+        result = explain_policy_local(policy)
+        assert "mixed" in result.summary.lower() or "Deny" in result.summary
+
+    def test_invalid_json_raises(self):
+        from app.analyzer import explain_policy_local
+        with pytest.raises(ValueError, match="Invalid JSON"):
+            explain_policy_local("not json")
+
+    def test_missing_statement_raises(self):
+        from app.analyzer import explain_policy_local
+        with pytest.raises(ValueError):
+            explain_policy_local(json.dumps({"Version": "2012-10-17"}))

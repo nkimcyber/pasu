@@ -17,6 +17,7 @@ import sys
 from app.analyzer import (
     HIGH_RISK_ACTIONS,
     MEDIUM_RISK_ACTIONS,
+    STRUCTURAL_RULE_COUNT,
     escalate_policy,
     escalate_policy_local,
     explain_policy,
@@ -80,7 +81,7 @@ def _print_banner() -> None:
 
     n_high   = len(HIGH_RISK_ACTIONS)
     n_medium = len(MEDIUM_RISK_ACTIONS)
-    n_total  = n_high + n_medium
+    n_total  = n_high + n_medium + STRUCTURAL_RULE_COUNT
 
     C = "\033[36m"   # cyan   — gate structure
     B = "\033[1m"    # bold   — PASU name (\033[1m immediately before text, nothing else)
