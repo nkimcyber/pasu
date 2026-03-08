@@ -4,24 +4,6 @@
 
 Pasu is a lightweight CLI tool that scans IAM policy JSON for security risks and explains them in plain English. No account setup, no cloud agent, no sales call — just `pip install pasu` and go.
 
-```
-$ pasu scan --file policy.json
-
-+===============================+
-|  Privilege Escalation Report  |
-+===============================+
-
-Risk Level: High
-
-Detected Risky Actions:
-  - iam:PassRole
-  - iam:CreatePolicyVersion
-  - iam:AttachRolePolicy
-
-Summary:
-  High privilege escalation risk: 3 dangerous action(s) detected.
-  Run with --ai for detailed analysis.
-```
 ### Mixed policy analysis
 ![Pasu Demo - S3 Policy](docs/demo2.gif)
 
