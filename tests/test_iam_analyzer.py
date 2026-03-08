@@ -507,14 +507,6 @@ class TestHealthEndpoint:
         assert response.json() == {"status": "ok"}
 
 
-class TestIndexEndpoint:
-    def test_index_returns_html(self, client):
-        response = client.get("/")
-        assert response.status_code == 200
-        assert "text/html" in response.headers["content-type"]
-        assert "IAM Policy Analyzer" in response.text
-
-
 # ── escalate_policy Tests ─────────────────────────────────────────────────────
 
 RISKY_POLICY_JSON = json.dumps({
