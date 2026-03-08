@@ -79,6 +79,7 @@ class EscalationResult(BaseModel):
         ..., description="Detailed finding for each detected risky action."
     )
     summary: str = Field(..., description="One-sentence overall risk summary.")
+    risk_score: int = Field(default=0, description="Numeric risk score 0-100.")
     status: str = Field(default="ok")
 
 

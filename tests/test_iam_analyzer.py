@@ -1708,3 +1708,171 @@ class TestCliFixOutput:
         assert exc_info.value.code == 1
         data = json.loads(buf.getvalue())
         assert data["status"] == "error"
+
+# ── Risk Score Tests ──────────────────────────────────────────────────────────
+
+class TestCalculateRiskScore:
+    """Tests for calculate_risk_score() and risk_score_label()."""
+
+    from app.analyzer import calculate_risk_score, risk_score_label
+
+    _FULL_ADMIN_POLICY = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+    })
+
+    _SINGLE_HIGH_POLICY = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": "arn:aws:iam::123456789012:role/MyRole",
+        }],
+    })
+
+    _SINGLE_MEDIUM_POLICY = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "sts:AssumeRole",
+            "Resource": "arn:aws:iam::123456789012:role/MyRole",
+        }],
+    })
+
+    _CLEAN_POLICY = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::my-bucket/*",
+        }],
+    })
+
+    def test_full_admin_scores_80_plus(self):
+        from app.analyzer import calculate_risk_score
+        score = calculate_risk_score(self._FULL_ADMIN_POLICY)
+        assert score >= 80, f"Expected >=80, got {score}"
+
+    def test_full_admin_score_capped_at_100(self):
+        from app.analyzer import calculate_risk_score
+        score = calculate_risk_score(self._FULL_ADMIN_POLICY)
+        assert score == 100
+
+    def test_single_high_risk_action_scores_8_to_20(self):
+        from app.analyzer import calculate_risk_score
+        score = calculate_risk_score(self._SINGLE_HIGH_POLICY)
+        assert 8 <= score <= 20, f"Expected 8-20, got {score}"
+
+    def test_single_medium_risk_action_scores_4_to_10(self):
+        from app.analyzer import calculate_risk_score
+        score = calculate_risk_score(self._SINGLE_MEDIUM_POLICY)
+        assert 4 <= score <= 10, f"Expected 4-10, got {score}"
+
+    def test_clean_policy_scores_zero(self):
+        from app.analyzer import calculate_risk_score
+        score = calculate_risk_score(self._CLEAN_POLICY)
+        assert score == 0
+
+    def test_score_never_exceeds_100(self):
+        from app.analyzer import calculate_risk_score
+        # Many statements with overlapping high-risk actions
+        many_stmts = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                {"Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
+                {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+            ],
+        }
+        score = calculate_risk_score(json.dumps(many_stmts))
+        assert score <= 100
+
+    def test_risk_level_mapping_low(self):
+        from app.analyzer import risk_score_label
+        assert risk_score_label(0) == "Low"
+        assert risk_score_label(20) == "Low"
+
+    def test_risk_level_mapping_medium(self):
+        from app.analyzer import risk_score_label
+        assert risk_score_label(21) == "Medium"
+        assert risk_score_label(50) == "Medium"
+
+    def test_risk_level_mapping_high(self):
+        from app.analyzer import risk_score_label
+        assert risk_score_label(51) == "High"
+        assert risk_score_label(100) == "High"
+
+    def test_score_in_escalate_json_output(self, tmp_path):
+        from app.cli import cmd_escalate
+        policy_file = tmp_path / "p.json"
+        policy_file.write_text(self._FULL_ADMIN_POLICY)
+        args = argparse.Namespace(
+            file=str(policy_file), format="json", ai=False
+        )
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        data = json.loads(buf.getvalue())
+        assert "risk_score" in data
+        assert isinstance(data["risk_score"], int)
+        assert data["risk_score"] >= 80
+
+    def test_fix_shows_before_after_score_in_json(self, tmp_path):
+        from app.cli import cmd_fix
+        policy_file = tmp_path / "p.json"
+        policy_file.write_text(self._FULL_ADMIN_POLICY)
+        args = argparse.Namespace(
+            file=str(policy_file), format="json", output=None
+        )
+        with _capture_stdout() as buf:
+            cmd_fix(args)
+        data = json.loads(buf.getvalue())
+        assert "original_risk_score" in data
+        assert "fixed_risk_score" in data
+        assert data["original_risk_score"] > data["fixed_risk_score"]
+
+    def test_fix_shows_before_after_score_in_text(self, tmp_path):
+        from app.cli import cmd_fix
+        policy_file = tmp_path / "p.json"
+        policy_file.write_text(self._FULL_ADMIN_POLICY)
+        args = argparse.Namespace(
+            file=str(policy_file), format="text", output=None
+        )
+        with _capture_stdout() as buf:
+            cmd_fix(args)
+        output = buf.getvalue()
+        assert "Risk Score" in output
+        assert "→" in output
+
+    def test_sarif_includes_risk_score_in_properties(self, tmp_path):
+        from app.cli import cmd_escalate
+        policy_file = tmp_path / "p.json"
+        policy_file.write_text(self._FULL_ADMIN_POLICY)
+        args = argparse.Namespace(
+            file=str(policy_file), format="sarif", ai=False
+        )
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        data = json.loads(buf.getvalue())
+        run = data["runs"][0]
+        assert "properties" in run
+        assert "risk_score" in run["properties"]
+        assert run["properties"]["risk_score"] >= 80
+
+    def test_escalate_local_result_has_risk_score_field(self):
+        from app.analyzer import escalate_policy_local
+        result = escalate_policy_local(self._FULL_ADMIN_POLICY)
+        assert hasattr(result, "risk_score")
+        assert result.risk_score >= 80
+
+    def test_not_action_adds_r006_score(self):
+        from app.analyzer import calculate_risk_score
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "NotAction": ["s3:DeleteObject"],
+                "Resource": "*",
+            }],
+        })
+        score = calculate_risk_score(policy)
+        assert score >= 10  # R006 alone = 10

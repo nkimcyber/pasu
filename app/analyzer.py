@@ -733,6 +733,132 @@ def analyze_policy_rules(policy_json: str) -> list[RuleFinding]:
     return findings
 
 
+def calculate_risk_score(policy_json: str) -> int:
+    """Calculate a numeric risk score (0-100) for an IAM policy.
+
+    Scoring rules applied per Allow statement:
+    - Each HIGH_RISK_ACTION detected: +8
+    - Each MEDIUM_RISK_ACTION detected: +4
+    - R001 (Resource: * present): +10
+    - R002 (arn:aws:s3:::* or arn:aws:s3:::*/* present): +6
+    - R005 (sensitive action without Condition block): +5
+    - R006 (NotAction inverse grant): +10
+    - R007 (NotResource inverse grant): +10
+    - Full admin (Action: * with Resource: *): +30
+    - Service wildcard (e.g. s3:*, iam:*): +10 each
+
+    Score is capped at 100.
+
+    Args:
+        policy_json: Raw IAM policy JSON string.
+
+    Returns:
+        Integer risk score in [0, 100].
+
+    Raises:
+        ValueError: If policy_json is not valid JSON or not a valid IAM policy.
+    """
+    try:
+        parsed = json.loads(policy_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Invalid JSON provided.") from exc
+
+    validate_iam_policy(parsed)
+
+    score = 0
+    _S3_ALL = {"arn:aws:s3:::*", "arn:aws:s3:::*/*"}
+
+    for stmt in parsed.get("Statement", []):
+        if stmt.get("Effect") != "Allow":
+            continue
+
+        has_not_action = "NotAction" in stmt
+        has_not_resource = "NotResource" in stmt
+
+        # R006: NotAction inverse grant
+        if has_not_action:
+            score += 10
+        # R007: NotResource inverse grant
+        if has_not_resource:
+            score += 10
+
+        if has_not_action:
+            continue  # cannot evaluate specific actions further
+
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        actions_lower = {a.lower() for a in actions}
+
+        resources = stmt.get("Resource", [])
+        if isinstance(resources, str):
+            resources = [resources]
+        resources_set = set(resources)
+
+        has_full_wildcard_action = "*" in actions_lower
+        has_full_wildcard_resource = "*" in resources_set
+        condition = stmt.get("Condition")
+
+        # Full admin bonus: Action:* with Resource:*
+        if has_full_wildcard_action and has_full_wildcard_resource:
+            score += 30
+
+        # Service wildcard bonus: +10 per service:* (not counting the bare "*")
+        for action in actions_lower:
+            if action != "*" and action.endswith(":*"):
+                score += 10
+
+        # Action-based scoring: +8 per HIGH, +4 per MEDIUM
+        if has_full_wildcard_action:
+            score += len(HIGH_RISK_ACTIONS) * 8
+            score += len(MEDIUM_RISK_ACTIONS) * 4
+        else:
+            matched_high = actions_lower & HIGH_RISK_ACTIONS
+            matched_medium = actions_lower & MEDIUM_RISK_ACTIONS
+            score += len(matched_high) * 8
+            score += len(matched_medium) * 4
+
+        # Structural rule scoring
+        # R001: Unrestricted resource
+        if has_full_wildcard_resource:
+            score += 10
+
+        # R002: Access to all S3 buckets
+        if resources_set & _S3_ALL:
+            score += 6
+
+        # R005: Sensitive action without Condition
+        if has_full_wildcard_action:
+            has_sensitive = True
+        else:
+            matched_high = actions_lower & HIGH_RISK_ACTIONS
+            matched_medium = actions_lower & MEDIUM_RISK_ACTIONS
+            has_sensitive = bool(matched_high or matched_medium) or (
+                has_full_wildcard_resource
+                and any(a in _CONTEXT_MEDIUM for a in actions_lower)
+            )
+        if has_sensitive and not condition:
+            score += 5
+
+    return min(score, 100)
+
+
+def risk_score_label(score: int) -> str:
+    """Return the risk level label for a numeric score.
+
+    Args:
+        score: Integer in [0, 100].
+
+    Returns:
+        'Low', 'Medium', or 'High'.
+    """
+    if score <= 20:
+        return "Low"
+    if score <= 50:
+        return "Medium"
+    return "High"
+
+
 def explain_policy_local(policy_json: str) -> ExplainResult:
     """Generate a rule-based plain-English explanation with no Claude API call.
 
@@ -848,6 +974,7 @@ def escalate_policy_local(policy_json: str) -> EscalationResult:
         detected_actions=detected,
         findings=[],
         summary=summary,
+        risk_score=calculate_risk_score(policy_json),
     )
 
 

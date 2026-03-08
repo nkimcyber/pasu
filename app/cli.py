@@ -20,11 +20,13 @@ from app.analyzer import (
     MEDIUM_RISK_ACTIONS,
     STRUCTURAL_RULE_COUNT,
     analyze_policy_rules,
+    calculate_risk_score,
     escalate_policy,
     escalate_policy_local,
     explain_policy,
     explain_policy_local,
     fix_policy_local,
+    risk_score_label,
 )
 
 
@@ -60,6 +62,16 @@ def _color(text: str, code: str) -> str:
 def _risk_color(risk_level: str) -> str:
     mapping = {"High": _RED, "Medium": _YELLOW, "Low": _GREEN}
     return mapping.get(risk_level, _WHITE)
+
+
+def _risk_bar(score: int) -> str:
+    """Return a 20-char filled/empty bar colored by risk level, e.g. '████░░░░░░░░░░░░░░░░ 20/100 (Low)'."""
+    filled = round(score / 100 * 20)
+    empty = 20 - filled
+    bar = "\u2588" * filled + "\u2591" * empty
+    level = risk_score_label(score)
+    color = _risk_color(level)
+    return f"{_color(bar, color)} {score}/100 ({level})"
 
 
 def _header(title: str) -> str:
@@ -171,6 +183,7 @@ def _print_escalate(result) -> None:
     print(_header("Privilege Escalation Report"))
     risk_label = _color(result.risk_level, _BOLD + risk_code)
     print(_section("Risk Level") + f"  {risk_label}")
+    print(_section("Risk Score") + f"  {_risk_bar(result.risk_score)}")
     print(_section("Summary"))
     print(f"  {result.summary}")
 
@@ -206,6 +219,7 @@ def _explain_to_json(result) -> dict:
 def _escalate_to_json(result, rule_findings) -> dict:
     return {
         "risk_level": result.risk_level,
+        "risk_score": result.risk_score,
         "detected_actions": result.detected_actions,
         "findings": [f.model_dump() for f in result.findings],
         "rule_findings": [f.model_dump() for f in rule_findings],
@@ -286,23 +300,31 @@ def _build_sarif(policy_path: str, rule_findings, escalate_result) -> dict:
                 "locations": [{"physicalLocation": {"artifactLocation": {"uri": policy_path}}}],
             })
 
+    run_properties: dict = {}
+    if escalate_result is not None:
+        run_properties["risk_score"] = escalate_result.risk_score
+
+    run: dict = {
+        "tool": {
+            "driver": {
+                "name": "pasu",
+                "version": version,
+                "informationUri": "https://pypi.org/project/pasu/",
+                "rules": list(rules_dict.values()),
+            }
+        },
+        "results": results,
+    }
+    if run_properties:
+        run["properties"] = run_properties
+
     return {
         "$schema": (
             "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/"
             "sarif-2.1/schema/sarif-schema-2.1.0.json"
         ),
         "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "pasu",
-                    "version": version,
-                    "informationUri": "https://pypi.org/project/pasu/",
-                    "rules": list(rules_dict.values()),
-                }
-            },
-            "results": results,
-        }],
+        "runs": [run],
     }
 
 
@@ -417,7 +439,8 @@ def _fix_to_json(result) -> dict:
     }
 
 
-def _print_fix(result, output_path: str | None = None) -> None:
+def _print_fix(result, output_path: str | None = None,
+               original_score: int = 0, fixed_score: int = 0) -> None:
     orig_code = _risk_color(result.original_risk_level)
     fixed_code = _risk_color(result.fixed_risk_level)
     print(_header("IAM Policy Fix Report"))
@@ -425,6 +448,10 @@ def _print_fix(result, output_path: str | None = None) -> None:
         _section("Risk Level")
         + f"  {_color(result.original_risk_level, _BOLD + orig_code)}"
         + f"  →  {_color(result.fixed_risk_level, _BOLD + fixed_code)}"
+    )
+    print(
+        _section("Risk Score")
+        + f"  {_risk_bar(original_score)}  →  {_risk_bar(fixed_score)}"
     )
 
     if result.changes:
@@ -467,6 +494,9 @@ def cmd_fix(args: argparse.Namespace) -> None:
         _handle_error(f"Validation error: {exc}", use_machine)
         return
 
+    original_score = calculate_risk_score(policy_json)
+    fixed_score = calculate_risk_score(json.dumps(result.fixed_policy))
+
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8") as fh:
@@ -476,9 +506,12 @@ def cmd_fix(args: argparse.Namespace) -> None:
             return
 
     if args.format == "json":
-        print(json.dumps(_fix_to_json(result), indent=2))
+        fix_data = _fix_to_json(result)
+        fix_data["original_risk_score"] = original_score
+        fix_data["fixed_risk_score"] = fixed_score
+        print(json.dumps(fix_data, indent=2))
     else:
-        _print_fix(result, args.output)
+        _print_fix(result, args.output, original_score, fixed_score)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
