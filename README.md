@@ -4,14 +4,8 @@
 
 Pasu is a lightweight CLI tool that scans IAM policy JSON for security risks and explains them in plain English. No account setup, no cloud agent, no sales call — just `pip install pasu` and go.
 
-### Mixed policy analysis
-![Pasu Demo - S3 Policy](docs/demo2.gif)
-
-### Dangerous policy detection
-![Pasu Demo - Dangerous Policy](docs/demo1.gif)
-
-### Auto-fix dangerous policies
-![Pasu Demo - Fix Policy](docs/demo3.gif)
+### Pasu in Action
+![Pasu Demo](docs/demo_pasu_combined.gif)
 
 ---
 
