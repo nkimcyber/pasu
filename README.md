@@ -49,7 +49,7 @@ Requires Python 3.11+. Pasu runs locally by default and does not require an API 
 ```text
 Risk Level  Medium
 
-Risk Score  ██████░░░░░░░░░░░░░░ 31/100 (Medium)
+Risk Score  31/100 (Medium)
 
 Summary
   Medium privilege escalation risk: 2 reviewed high-risk action(s) detected, 1 composite attack pattern(s) matched, 4 rule finding(s) total. Run with --ai for detailed analysis.
