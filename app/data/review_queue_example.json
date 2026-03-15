@@ -1,0 +1,59 @@
+{
+  "generated_at": "2026-03-14T17:22:09+00:00",
+  "source_catalog_version": 2,
+  "items": [
+    {
+      "action": "iam:CreateServiceSpecificCredential",
+      "service": "iam",
+      "name": "CreateServiceSpecificCredential",
+      "access_level": "Write",
+      "resource_types": ["user"],
+      "condition_keys": [
+        "aws:RequestedRegion",
+        "iam:ResourceTag/Department"
+      ],
+      "dependent_actions": [],
+      "status": "unclassified",
+      "candidate_capabilities": [
+        "credential-exposure"
+      ],
+      "notes": "",
+      "reason": "New action present in catalog version 2 but absent from catalog version 1. Not yet mapped to any capability rule."
+    },
+    {
+      "action": "lambda:AddLayerVersionPermission",
+      "service": "lambda",
+      "name": "AddLayerVersionPermission",
+      "access_level": "Permissions management",
+      "resource_types": ["layerVersion"],
+      "condition_keys": [
+        "aws:RequestedRegion",
+        "lambda:Layer"
+      ],
+      "dependent_actions": [],
+      "status": "unclassified",
+      "candidate_capabilities": [
+        "resource-policy-manipulation"
+      ],
+      "notes": "Grants cross-account read access to a Lambda layer. May be relevant to supply-chain or lateral movement scenarios. Needs reviewer confirmation.",
+      "reason": "New action present in catalog version 2 but absent from catalog version 1. Permissions management access level flagged for priority review."
+    },
+    {
+      "action": "s3:GetBucketPolicyStatus",
+      "service": "s3",
+      "name": "GetBucketPolicyStatus",
+      "access_level": "Read",
+      "resource_types": ["bucket"],
+      "condition_keys": [
+        "s3:DataAccessPointArn",
+        "s3:authType",
+        "aws:RequestedRegion"
+      ],
+      "dependent_actions": [],
+      "status": "unclassified",
+      "candidate_capabilities": [],
+      "notes": "",
+      "reason": "New action present in catalog version 2 but absent from catalog version 1. Read-only; candidate_capabilities left empty pending reviewer assessment."
+    }
+  ]
+}

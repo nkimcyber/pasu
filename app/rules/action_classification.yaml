@@ -1,0 +1,202 @@
+{
+  "_governance": {
+    "schema_version": 1,
+    "authority": "app/action_classification.py is the programmatic loader and validator for this file. All records are validated against app/review_status.py (status), app/capabilities.py (capabilities), and the confidence enum defined in that module.",
+    "editing_policy": "Each entry must be the result of a deliberate human review. Do not add, modify, or remove entries via automated scripts without a reviewer sign-off. Bulk edits require a tracked PR.",
+    "field_constraints": {
+      "status": "Must be a value from ReviewStatus that is valid in the 'classification' context. Allowed: 'classified', 'not-applicable'. Do not use 'unclassified', 'deferred', or 'needs-research' here; those are review-queue states.",
+      "capabilities": "Must be a list of names from app/rules/capabilities.yaml. Empty list is allowed only when status is 'not-applicable'. Do not invent capability names; add them to capabilities.yaml first.",
+      "confidence": "Reviewer's assessed confidence in the classification. Allowed: 'high', 'medium', 'low'. Use 'high' when the action's risk is well-documented and unambiguous; 'medium' when context-dependent; 'low' when speculative or partially documented.",
+      "notes": "Free-form reviewer annotation. Explain non-obvious classifications, list known safe contexts, or record open questions. Required to be a string; may be empty."
+    }
+  },
+  "_field_reference": {
+    "status": {
+      "type": "string",
+      "enum": ["classified", "not-applicable"],
+      "source": "app/review_status.py :: ReviewStatus (classification-context values only)"
+    },
+    "capabilities": {
+      "type": "array of string",
+      "items_enum": "see app/rules/capabilities.yaml :: capabilities keys",
+      "source": "app/capabilities.py :: CAPABILITY_NAMES",
+      "empty_list_rule": "Only permitted when status is 'not-applicable'"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low"],
+      "source": "app/action_classification.py :: CONFIDENCE_LEVELS"
+    },
+    "notes": {
+      "type": "string",
+      "required": true,
+      "may_be_empty": true
+    }
+  },
+  "actions": {
+    "iam:PassRole": {
+      "status": "classified",
+      "capabilities": ["privilege-delegation"],
+      "confidence": "high",
+      "notes": "Core privilege escalation primitive. Allows any principal that holds this permission to attach any passable IAM role to an AWS service, effectively granting that service the role's full permissions. Risk is unconditional when Resource is '*'."
+    },
+    "ec2:RunInstances": {
+      "status": "classified",
+      "capabilities": ["compute-with-role"],
+      "confidence": "high",
+      "notes": "Launching an EC2 instance with an attached IAM instance profile executes arbitrary code under that profile's permissions. Requires iam:PassRole to attach a role at launch time, but the compute-with-role risk is attributed here."
+    },
+    "kms:Decrypt": {
+      "status": "classified",
+      "capabilities": ["secret-read"],
+      "confidence": "high",
+      "notes": "Decrypts ciphertext using a KMS customer-managed key. Grants access to any data encrypted under reachable keys, including secrets stored via Secrets Manager or SSM SecureString."
+    },
+    "s3:PutBucketPolicy": {
+      "status": "classified",
+      "capabilities": ["public-exposure", "cross-account-trust"],
+      "confidence": "high",
+      "notes": "Overwrites the bucket's resource-based policy. Can be used to make a bucket publicly readable/writable or to grant access to principals in arbitrary external AWS accounts."
+    },
+    "ec2:DescribeInstances": {
+      "status": "not-applicable",
+      "capabilities": [],
+      "confidence": "high",
+      "notes": "Read-only enumeration of EC2 instance metadata. No privilege escalation or data exfiltration path identified. Classified as not-applicable to the IAM risk model."
+    },
+
+    "iam:AttachRolePolicy": {
+      "status": "classified",
+      "capabilities": ["policy-modification"],
+      "confidence": "high",
+      "notes": "Attaches any managed policy to any IAM role. When the target policy grants elevated permissions (e.g. AdministratorAccess), this action alone completes a privilege escalation. Risk is unconditional when Resource is '*'."
+    },
+    "iam:AttachUserPolicy": {
+      "status": "classified",
+      "capabilities": ["policy-modification"],
+      "confidence": "high",
+      "notes": "Attaches any managed policy to any IAM user, including the caller. Directly elevates the user's effective permissions to whatever the attached policy grants."
+    },
+    "iam:AttachGroupPolicy": {
+      "status": "classified",
+      "capabilities": ["policy-modification"],
+      "confidence": "high",
+      "notes": "Attaches any managed policy to any IAM group, immediately affecting all group members. Can be used to escalate an entire team's permissions in one operation."
+    },
+    "iam:CreatePolicyVersion": {
+      "status": "classified",
+      "capabilities": ["policy-modification"],
+      "confidence": "high",
+      "notes": "Creates a new version of a managed policy with arbitrary JSON content. If the new version is set as default (or if iam:SetDefaultPolicyVersion is also available), all principals attached to that policy receive the new permissions immediately."
+    },
+    "iam:SetDefaultPolicyVersion": {
+      "status": "classified",
+      "capabilities": ["policy-modification"],
+      "confidence": "high",
+      "notes": "Activates an existing non-default policy version. Used in combination with iam:CreatePolicyVersion to stage a permissive version and then promote it, but also dangerous alone if a permissive version was previously created and left inactive."
+    },
+    "iam:PutRolePolicy": {
+      "status": "classified",
+      "capabilities": ["policy-modification"],
+      "confidence": "high",
+      "notes": "Writes an inline policy directly onto an IAM role. Inline policies take effect immediately and do not require a separate attach step, making this the most direct path to injecting arbitrary permissions onto an existing role."
+    },
+    "iam:PutUserPolicy": {
+      "status": "classified",
+      "capabilities": ["policy-modification"],
+      "confidence": "high",
+      "notes": "Writes an inline policy directly onto an IAM user, including the caller. Immediate effect without a separate attachment step."
+    },
+    "iam:CreateRole": {
+      "status": "classified",
+      "capabilities": ["policy-modification"],
+      "confidence": "medium",
+      "notes": "Creates a new IAM role with a caller-supplied trust policy and optional permission boundary. The role itself is empty at creation, so privilege escalation requires additional steps (e.g. iam:AttachRolePolicy, iam:PutRolePolicy, or iam:PassRole). Classified as policy-modification because the caller controls the trust and permission structure of the new principal. Confidence is medium because the risk is combinatorial rather than standalone."
+    },
+    "iam:UpdateAssumeRolePolicy": {
+      "status": "classified",
+      "capabilities": ["policy-modification", "cross-account-trust"],
+      "confidence": "high",
+      "notes": "Replaces the trust policy of an existing IAM role. Can be used to (a) broaden who can assume a role within the account (policy-modification risk) and (b) add trust to principals in external accounts, enabling cross-account assumption without creating a new role (cross-account-trust risk). Both risk paths are well-documented."
+    },
+    "iam:CreateAccessKey": {
+      "status": "classified",
+      "capabilities": ["credential-issuance"],
+      "confidence": "high",
+      "notes": "Generates a persistent AKID/secret-access-key pair for an IAM user. The credentials do not expire unless explicitly rotated. An attacker can create access keys for an existing high-privilege user to maintain out-of-band access independent of console sessions."
+    },
+
+    "lambda:CreateFunction": {
+      "status": "classified",
+      "capabilities": ["serverless-with-role"],
+      "confidence": "high",
+      "notes": "Deploys a new Lambda function with a caller-supplied execution role. Arbitrary code supplied at creation time executes under the execution role's permissions on each invocation. Requires iam:PassRole to attach the role, but the serverless-with-role risk is attributed here."
+    },
+    "lambda:UpdateFunctionCode": {
+      "status": "classified",
+      "capabilities": ["serverless-with-role"],
+      "confidence": "high",
+      "notes": "Replaces the code of an existing Lambda function without changing its execution role. This is a code-injection path: an attacker who cannot create a new function can still obtain the existing function's role permissions by replacing its logic. No iam:PassRole required."
+    },
+
+    "s3:PutBucketAcl": {
+      "status": "classified",
+      "capabilities": ["public-exposure"],
+      "confidence": "high",
+      "notes": "Changes a bucket-level ACL, including to canned ACLs such as 'public-read' or 'public-read-write'. This is an alternative public-exposure path that operates outside bucket policies and may bypass policy-based controls."
+    },
+    "s3:PutObjectAcl": {
+      "status": "classified",
+      "capabilities": ["public-exposure"],
+      "confidence": "high",
+      "notes": "Sets the ACL on an individual S3 object. Can make specific objects publicly readable regardless of the bucket's policy. Useful for targeted exfiltration of specific files without exposing the entire bucket."
+    },
+
+    "kms:DescribeKey": {
+      "status": "not-applicable",
+      "capabilities": [],
+      "confidence": "high",
+      "notes": "Returns metadata about a KMS key (ARN, description, key state, creation date). Does not decrypt data or return key material. Risk is limited to reconnaissance (identifying keys to target with kms:Decrypt). Classified as not-applicable because no capability in the taxonomy covers pure enumeration without data access."
+    },
+
+    "sts:AssumeRole": {
+      "status": "classified",
+      "capabilities": ["privilege-delegation"],
+      "confidence": "medium",
+      "notes": "Exchanges the caller's identity for temporary credentials scoped to the target role. Constitutes privilege delegation when the target role carries higher permissions than the caller, but the action is also used in legitimate cross-service and automation patterns. Confidence is medium because escalation depends on the specific role being assumed and the caller's existing permissions."
+    },
+
+    "secretsmanager:GetSecretValue": {
+      "status": "classified",
+      "capabilities": ["secret-read"],
+      "confidence": "high",
+      "notes": "Returns the current plaintext value of a Secrets Manager secret, which typically contains high-value credentials such as database passwords, API keys, or TLS private keys. Direct data exfiltration with no additional steps required."
+    },
+    "ssm:GetParameter": {
+      "status": "classified",
+      "capabilities": ["secret-read"],
+      "confidence": "medium",
+      "notes": "Reads an SSM Parameter Store value. SecureString parameters are decrypted and returned in plaintext, equivalent to retrieving a secret. Plain String and StringList parameters carry no inherent secret risk. Confidence is medium because the risk is conditional on the parameter type; policies cannot restrict by type at evaluation time, so the worst case must be assumed."
+    },
+
+    "rds:CopyDBSnapshot": {
+      "status": "classified",
+      "capabilities": ["data-read-sensitive"],
+      "confidence": "medium",
+      "notes": "Copies an RDS or Aurora database snapshot, potentially to another account. The copied snapshot contains the full database contents at the time of the source snapshot. Cross-account exfiltration requires a separate rds:ModifyDBSnapshotAttribute call; this action initiates the copy. Confidence is medium because the actionable risk depends on whether sharing to an external account is possible."
+    },
+
+    "s3:GetObject": {
+      "status": "classified",
+      "capabilities": ["data-read-sensitive"],
+      "confidence": "medium",
+      "notes": "Reads the content of an S3 object. Risk is context-dependent on the data stored in the bucket: a config bucket is different in sensitivity from a data-lake bucket containing PII or financial records. Confidence is medium; severity in practice scales with the Resource scope in the policy."
+    },
+    "dynamodb:Scan": {
+      "status": "classified",
+      "capabilities": ["data-read-sensitive"],
+      "confidence": "medium",
+      "notes": "Returns all items and attributes from a DynamoDB table, bypassing index-based access patterns. When Resource is '*', grants bulk read access to every table in the account. Confidence is medium because the severity depends on what data the tables contain, which cannot be determined from the IAM action alone."
+    }
+  }
+}

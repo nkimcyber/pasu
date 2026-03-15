@@ -11,6 +11,7 @@ import os
 import anthropic
 
 from app import aws_client
+from app.action_classification import load_action_classification
 from app.models import (
     AnalysisResult,
     EscalationFinding,
@@ -461,6 +462,122 @@ def _extract_allowed_actions(policy: dict) -> set[str]:
     return allowed
 
 
+def _detect_unknown_actions(
+    allowed_actions: set[str],
+    classification_lower: dict[str, dict],
+) -> list[str]:
+    """Return sorted list of allowed actions not present in any reviewed risk category.
+
+    An unknown action is one that is absent from HIGH_RISK_ACTIONS,
+    MEDIUM_RISK_ACTIONS, and the reviewed action_classification.yaml.
+    Wildcard patterns (containing '*') are excluded because they are
+    handled separately by _extract_wildcard_actions in the CLI layer.
+
+    Args:
+        allowed_actions:      Lowercase set of allowed actions from the policy.
+        classification_lower: Lowercase-keyed classification dict from
+                              _load_classification_lower().
+
+    Returns:
+        Sorted list of lowercase unknown action strings.
+    """
+    all_reviewed_lower: set[str] = (
+        {a.lower() for a in HIGH_RISK_ACTIONS}
+        | {a.lower() for a in MEDIUM_RISK_ACTIONS}
+        | set(classification_lower.keys())
+    )
+    return sorted(
+        action
+        for action in allowed_actions
+        if "*" not in action and action not in all_reviewed_lower
+    )
+
+
+def _add_to_review_queue(
+    unknown_actions: list[str],
+    queue_path: Path | None = None,
+) -> None:
+    """Insert scan-discovered unknown actions into review_queue.json.
+
+    Actions already present in the queue (case-insensitive match) are
+    skipped to prevent duplicates.  Failures are silently suppressed so
+    scan output is never blocked by a queue write error.
+
+    Args:
+        unknown_actions: Lowercase action keys found during scan that are
+                         absent from all reviewed risk categories.
+        queue_path:      Override the default file path (intended for tests).
+    """
+    if not unknown_actions:
+        return
+
+    try:
+        root = _discover_config_root()
+        resolved_path = queue_path or (root / "data" / "review_queue.json")
+
+        try:
+            queue: dict = json.loads(resolved_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            queue = {
+                "generated_at": "",
+                "source_catalog_version": 0,
+                "items": [],
+            }
+
+        # Build a lowercase set of already-queued action keys for deduplication.
+        existing_lower: set[str] = {
+            item["action"].lower() for item in queue.get("items", [])
+        }
+
+        # Build a case-insensitive index into the AWS catalog for metadata lookup.
+        catalog_actions: dict = AWS_CATALOG.get("actions", {})
+        catalog_lower: dict[str, dict] = {k.lower(): v for k, v in catalog_actions.items()}
+
+        new_items: list[dict] = []
+        for action in unknown_actions:
+            if action in existing_lower:
+                continue  # already queued — skip
+
+            parts = action.split(":", 1)
+            service = parts[0] if len(parts) == 2 else action
+            name = parts[1] if len(parts) == 2 else action
+
+            # Use catalog metadata when available; fall back to safe defaults.
+            catalog_entry = catalog_lower.get(action, {})
+            access_level: str = catalog_entry.get("access_level", "Write")
+            # Ensure access_level is one of the schema-allowed enum values.
+            _VALID_ACCESS_LEVELS = {"List", "Read", "Write", "Tagging", "Permissions management"}
+            if access_level not in _VALID_ACCESS_LEVELS:
+                access_level = "Write"
+
+            new_items.append({
+                "action": action,
+                "service": service.lower(),
+                "name": name,
+                "access_level": access_level,
+                "resource_types": list(catalog_entry.get("resource_types", [])),
+                "condition_keys": list(catalog_entry.get("condition_keys", [])),
+                "dependent_actions": list(catalog_entry.get("dependent_actions", [])),
+                "status": "unclassified",
+                "candidate_capabilities": [],
+                "notes": "",
+                "reason": (
+                    "Action found in policy scan but absent from the reviewed "
+                    "classification file and AWS service catalog."
+                ),
+            })
+
+        if new_items:
+            from datetime import datetime, timezone
+            queue["items"] = queue.get("items", []) + new_items
+            queue["generated_at"] = datetime.now(timezone.utc).isoformat()
+            resolved_path.write_text(
+                json.dumps(queue, indent=2), encoding="utf-8"
+            )
+    except Exception:
+        pass  # fail open — queue update is advisory, must never block scan output
+
+
 def _detect_risky_actions(allowed_actions: set[str]) -> tuple[list[str], str]:
     """Detect high and medium risk actions from the allowed action set.
 
@@ -624,10 +741,10 @@ def analyze_policy_rules(policy_json: str) -> list[RuleFinding]:
             findings.append(RuleFinding(
                 rule_id="R003",
                 severity="high",
-                title=f"Dangerous action: {action}",
+                title=f"Reviewed high-risk action: {action}",
                 description=_ACTION_DESCRIPTIONS.get(
                     action,
-                    f"The action '{action}' can be used for privilege escalation.",
+                    f"Reviewed classification: '{action}' is confirmed high-risk for privilege escalation.",
                 ),
                 statement_index=i,
             ))
@@ -636,10 +753,10 @@ def analyze_policy_rules(policy_json: str) -> list[RuleFinding]:
             findings.append(RuleFinding(
                 rule_id="R004",
                 severity="medium",
-                title=f"Sensitive action: {action}",
+                title=f"Reviewed medium-risk action: {action}",
                 description=_ACTION_DESCRIPTIONS.get(
                     action,
-                    f"The action '{action}' grants access to sensitive data or capabilities.",
+                    f"Reviewed classification: '{action}' is assessed as medium-risk. Risk is context-dependent.",
                 ),
                 statement_index=i,
             ))
@@ -887,6 +1004,81 @@ def explain_policy_local(policy_json: str) -> ExplainResult:
     return ExplainResult(summary=summary, details=details)
 
 
+def _run_composite_detection(
+    policy_json: str,
+    classification: dict[str, dict],
+) -> list[dict]:
+    """Run composite rule detection and return serialisable finding dicts.
+
+    Builds :class:`~app.action_classification.ClassificationLookupResult`
+    objects for every allowed action in the policy (case-insensitively matched
+    against the canonical classification keys), then evaluates them against
+    all loaded composite rules.
+
+    The function fails open: any exception during loading or evaluation returns
+    an empty list so that the escalation result is never blocked by composite
+    detection errors.
+
+    Args:
+        policy_json:    Raw IAM policy JSON string.
+        classification: Original (mixed-case-keyed) classification dict from
+                        :func:`load_action_classification`.
+
+    Returns:
+        List of dicts, one per triggered :class:`~app.composite_engine.CompositeFinding`,
+        sorted by ``rule_id``.  Each dict has keys: ``rule_id``, ``title``,
+        ``severity``, ``confidence``, ``contributing_actions``,
+        ``matched_required``, ``matched_optional``, ``rationale``,
+        ``confidence_explanation``.
+    """
+    try:
+        from app.action_classification import lookup_action
+        from app.composite_detections import load_composite_detections
+        from app.composite_engine import evaluate_composite_rules
+
+        # Build a lowercase → canonical-key index so lookup_action gets the
+        # correctly-cased key that matches the classification file.
+        canonical: dict[str, str] = {k.lower(): k for k in classification}
+
+        parsed = json.loads(policy_json)
+        action_results = []
+        seen_lower: set[str] = set()
+
+        for stmt in parsed.get("Statement", []):
+            if stmt.get("Effect") != "Allow":
+                continue
+            actions = stmt.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            for a in actions:
+                al = a.lower()
+                if al in seen_lower:
+                    continue
+                seen_lower.add(al)
+                key = canonical.get(al, a)
+                action_results.append(lookup_action(key, classification))
+
+        rules = load_composite_detections()
+        findings = evaluate_composite_rules(action_results, rules)
+
+        return [
+            {
+                "rule_id": f.rule_id,
+                "title": f.title,
+                "severity": f.severity,
+                "confidence": f.confidence,
+                "contributing_actions": list(f.contributing_actions),
+                "matched_required": sorted(f.matched_required),
+                "matched_optional": sorted(f.matched_optional),
+                "rationale": f.rationale,
+                "confidence_explanation": f.confidence_explanation,
+            }
+            for f in findings
+        ]
+    except Exception:
+        return []  # fail open — composite detection is advisory, must never block scan
+
+
 def escalate_policy_local(policy_json: str) -> EscalationResult:
     """Run local rule-based privilege escalation detection with no Claude API call.
 
@@ -914,6 +1106,23 @@ def escalate_policy_local(policy_json: str) -> EscalationResult:
     allowed_actions = _extract_allowed_actions(parsed)
     detected, _ = _detect_risky_actions(allowed_actions)
 
+    # Detect actions absent from every reviewed risk category.
+    # These are honest unknowns — not confirmed safe, not confirmed risky.
+    classification_lower = _load_classification_lower()
+    unknown_actions = _detect_unknown_actions(allowed_actions, classification_lower)
+
+    # Persist scan-discovered unknown actions to the review queue (fail-open).
+    if unknown_actions:
+        _add_to_review_queue(unknown_actions)
+
+    # Composite detection — multi-capability attack patterns (fail-open).
+    # Requires the original (mixed-case) classification dict for canonical lookup.
+    try:
+        _classification_original = load_action_classification()
+    except Exception:
+        _classification_original = {}
+    composite_findings = _run_composite_detection(policy_json, _classification_original)
+
     # Structural rule engine — all three categories
     rule_findings = analyze_policy_rules(policy_json)
 
@@ -922,29 +1131,196 @@ def escalate_policy_local(policy_json: str) -> EscalationResult:
     risk_level = risk_score_label(risk_score)
 
     n_rules = len(rule_findings)
-    rule_note = f", {n_rules} rule finding(s) total" if rule_findings else ""
 
-    if not detected and not rule_findings:
+    # Build an accurate summary that reflects ACTUAL action severity tiers, not
+    # just the overall risk_level band.  iam:PassRole is high-risk even in a
+    # policy that scores as "Medium" overall.
+    _high_lower: set[str] = {a.lower() for a in HIGH_RISK_ACTIONS}
+    n_high = sum(1 for a in detected if a.lower() in _high_lower)
+    n_medium = len(detected) - n_high
+    n_unknown = len(unknown_actions)
+
+    n_composite = len(composite_findings)
+
+    if not detected and not rule_findings and not unknown_actions and not composite_findings:
         summary = "No privilege escalation risks detected in this policy."
-    elif risk_level == "High":
-        summary = (
-            f"High privilege escalation risk: {len(detected)} dangerous action(s) detected"
-            f"{rule_note}. Run with --ai for detailed analysis."
-        )
     else:
+        action_parts: list[str] = []
+        if n_high > 0 and n_medium > 0:
+            action_parts.append(
+                f"{n_high} reviewed high-risk and {n_medium} "
+                f"medium-risk action(s) detected"
+            )
+        elif n_high > 0:
+            action_parts.append(f"{n_high} reviewed high-risk action(s) detected")
+        elif n_medium > 0:
+            action_parts.append(f"{n_medium} reviewed medium-risk action(s) detected")
+        if n_composite > 0:
+            action_parts.append(
+                f"{n_composite} composite attack pattern(s) matched"
+            )
+        if n_unknown > 0:
+            action_parts.append(
+                f"{n_unknown} unknown action(s) added to review queue"
+            )
+        if not action_parts:
+            # Only structural findings (rule_findings non-empty but no detected/unknown)
+            action_parts.append(f"{n_rules} structural issue(s) detected")
+        elif rule_findings:
+            action_parts.append(f"{n_rules} rule finding(s) total")
+
+        prefix = f"{risk_level} privilege escalation risk"
         summary = (
-            f"Medium privilege escalation risk: {len(detected)} sensitive action(s) detected"
-            f"{rule_note}. Run with --ai for detailed analysis."
+            f"{prefix}: {', '.join(action_parts)}. "
+            "Run with --ai for detailed analysis."
         )
 
     return EscalationResult(
         risk_level=risk_level,
         detected_actions=detected,
+        unknown_actions=unknown_actions,
+        composite_findings=composite_findings,
         findings=[],
         summary=summary,
         risk_score=risk_score,
     )
 
+
+
+# ── Fix confidence gate ───────────────────────────────────────────────────────
+
+def _load_classification_lower() -> dict[str, dict]:
+    """Load action classification and return a lowercase-keyed index.
+
+    Returns an empty dict when the file cannot be loaded so the caller can
+    always proceed (fail-open) while still logging blocked cases when records
+    are available.
+    """
+    try:
+        classification = load_action_classification()
+        return {k.lower(): v for k, v in classification.items()}
+    except Exception:
+        return {}
+
+
+def _fix_action_gate_reason(
+    action_lower: str,
+    classification_lower: dict[str, dict],
+) -> str | None:
+    """Return a human-readable blocking reason if this action must not be auto-fixed.
+
+    Returns ``None`` when the action may be auto-fixed (gate passes).
+
+    Gate rules (evaluated in order):
+
+    1. **Unknown** — action is absent from the classification file.
+       Auto-fix requires a confirmed, reviewed classification record.
+    2. **Not-applicable** — action was reviewed and found out-of-scope for the
+       IAM risk model.  Auto-removing it would be incorrect.
+    3. **Low confidence** — the classification record carries ``confidence="low"``.
+       The evidence is too speculative to justify automated removal.
+
+    Actions with ``status="classified"`` and ``confidence`` of ``"medium"`` or
+    ``"high"`` pass the gate.
+
+    Args:
+        action_lower:          Lowercase IAM action key (e.g. ``"iam:passrole"``).
+        classification_lower:  Lowercase-keyed classification index produced by
+                               :func:`_load_classification_lower`.
+
+    Returns:
+        A short human-readable reason string when the gate blocks the fix, or
+        ``None`` when the fix is permitted.
+    """
+    record = classification_lower.get(action_lower)
+
+    if record is None:
+        return (
+            "no reviewed classification record exists — "
+            "auto-fix requires a confirmed classification"
+        )
+
+    status = record.get("status", "")
+    if status == "not-applicable":
+        return (
+            "action is classified as not-applicable to the IAM risk model — "
+            "auto-removal would be incorrect"
+        )
+
+    confidence = record.get("confidence", "")
+    if confidence == "low":
+        return (
+            "classification confidence is 'low' — "
+            "insufficient evidence for automated removal"
+        )
+
+    return None  # classified + medium or high confidence → gate passes
+
+
+def _composite_low_confidence_notes(
+    policy_json: str,
+    classification: dict[str, dict],
+) -> list[str]:
+    """Return manual-review notes for any low-confidence composite findings.
+
+    Runs the composite detection engine against the policy and surfaces any
+    findings whose derived confidence is ``"low"``.  These patterns have
+    uncertain evidence quality and must not be auto-fixed without human review.
+
+    Failures (missing rules file, import errors, etc.) are silently suppressed
+    so this advisory layer never blocks the fix function itself.
+
+    Args:
+        policy_json:    Raw IAM policy JSON string.
+        classification: Original (PascalCase-keyed) classification dict.
+
+    Returns:
+        List of human-readable strings, one per low-confidence composite
+        finding.  Empty list when no such findings exist or on any error.
+    """
+    notes: list[str] = []
+    try:
+        from app.action_classification import ClassificationLookupResult, lookup_action
+        from app.composite_detections import load_composite_detections
+        from app.composite_engine import evaluate_composite_rules
+
+        # Build a lowercase → canonical-key map for case-insensitive lookup.
+        canonical: dict[str, str] = {k.lower(): k for k in classification}
+
+        parsed = json.loads(policy_json)
+        action_results: list[ClassificationLookupResult] = []
+        seen_lower: set[str] = set()
+
+        for stmt in parsed.get("Statement", []):
+            if stmt.get("Effect") != "Allow":
+                continue
+            actions = stmt.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            for a in actions:
+                al = a.lower()
+                if al in seen_lower:
+                    continue
+                seen_lower.add(al)
+                key = canonical.get(al, a)
+                action_results.append(lookup_action(key, classification))
+
+        rules = load_composite_detections()
+        findings = evaluate_composite_rules(action_results, rules)
+
+        for f in findings:
+            if f.confidence == "low":
+                actions_str = ", ".join(f.contributing_actions)
+                notes.append(
+                    f"Composite pattern '{f.title}' (rule {f.rule_id}) detected "
+                    f"with low confidence — auto-fix withheld for implicated "
+                    f"actions ({actions_str}). "
+                    f"Confidence explanation: {f.confidence_explanation}"
+                )
+    except Exception:
+        pass  # fail open: composite analysis is advisory only
+
+    return notes
 
 
 # ── Fix Function ─────────────────────────────────────────────────────────────
@@ -978,6 +1354,18 @@ def fix_policy_local(policy_json: str) -> FixResult:
 
     original_risk_score = calculate_risk_score(policy_json)
     original_risk_level = risk_score_label(original_risk_score)
+
+    # ── Confidence gate setup ─────────────────────────────────────────────────
+    # Load the reviewed action classification so each HIGH_RISK removal can be
+    # checked against its evidence quality.  Fails open (empty dict) when the
+    # file is unavailable so the function always produces output.
+    classification_lower = _load_classification_lower()
+
+    # Keep the original (PascalCase-keyed) dict for composite analysis.
+    try:
+        _classification_original = load_action_classification()
+    except Exception:
+        _classification_original = {}
 
     changes: list[FixChange] = []
     manual_review_needed: list[str] = []
@@ -1077,16 +1465,28 @@ def fix_policy_local(policy_json: str) -> FixResult:
                             seen.add(placeholder)
                             fixed_actions.append(placeholder)
                 elif al in HIGH_RISK_ACTIONS:
-                    # High-risk → remove
-                    changes.append(FixChange(
-                        type="removed_action",
-                        statement_index=i,
-                        action=action,
-                        reason=_ACTION_DESCRIPTIONS.get(
-                            al,
-                            f"'{action}' is a privilege escalation risk",
-                        ),
-                    ))
+                    # High-risk → check confidence gate before removing.
+                    gate_reason = _fix_action_gate_reason(al, classification_lower)
+                    if gate_reason:
+                        # Gate blocked: keep action unchanged, request manual review.
+                        manual_review_needed.append(
+                            f"{statement_label}: auto-fix withheld for '{action}' — "
+                            f"{gate_reason}"
+                        )
+                        if action not in seen:
+                            seen.add(action)
+                            fixed_actions.append(action)
+                    else:
+                        # Gate passed (classified + medium/high confidence) → remove.
+                        changes.append(FixChange(
+                            type="removed_action",
+                            statement_index=i,
+                            action=action,
+                            reason=_ACTION_DESCRIPTIONS.get(
+                                al,
+                                f"'{action}' is a privilege escalation risk",
+                            ),
+                        ))
                 else:
                     # Safe action → keep
                     if action not in seen:
@@ -1129,6 +1529,18 @@ def fix_policy_local(policy_json: str) -> FixResult:
     fixed_policy_json = json.dumps(fixed_policy)
     fixed_risk_score = calculate_risk_score(fixed_policy_json)
     fixed_risk_level = risk_score_label(fixed_risk_score)
+
+    # ── Composite low-confidence advisory notes ───────────────────────────────
+    # Any composite pattern with low derived confidence is flagged for manual
+    # review even when individual actions passed the per-action gate above.
+    # Wrapped in try/except so a failure here never blocks fix output.
+    try:
+        composite_notes = _composite_low_confidence_notes(
+            policy_json, _classification_original
+        )
+        manual_review_needed.extend(composite_notes)
+    except Exception:
+        pass
 
     return FixResult(
         original_risk_level=original_risk_level,

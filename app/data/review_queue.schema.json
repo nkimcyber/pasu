@@ -1,0 +1,115 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "review_queue.schema.json",
+  "title": "IAM Analyzer Review Queue",
+  "description": "Schema for newly discovered AWS actions that exist in the AWS catalog but have not yet been reviewed in the classification layer. This file is populated by the catalog diff generator and consumed by the human review workflow.",
+  "type": "object",
+  "required": ["generated_at", "source_catalog_version", "items"],
+  "additionalProperties": false,
+  "properties": {
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 datetime (UTC preferred) at which this queue file was generated. Example: '2026-03-14T17:22:09+00:00'."
+    },
+    "source_catalog_version": {
+      "type": "integer",
+      "description": "The integer version number of the aws_catalog.json snapshot that was used to produce this queue. Matches the top-level 'version' field in aws_catalog.json."
+    },
+    "items": {
+      "type": "array",
+      "description": "Ordered list of unreviewed AWS actions pending classification. Each entry corresponds to one action key from the catalog.",
+      "items": {
+        "$ref": "#/definitions/ReviewItem"
+      }
+    }
+  },
+  "definitions": {
+    "ReviewItem": {
+      "type": "object",
+      "title": "ReviewItem",
+      "description": "A single AWS action that requires human review before it can be promoted into the classified capability layer.",
+      "required": [
+        "action",
+        "service",
+        "name",
+        "access_level",
+        "resource_types",
+        "condition_keys",
+        "dependent_actions",
+        "status",
+        "candidate_capabilities",
+        "notes",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "Fully-qualified IAM action key in 'service:ActionName' format. Must match exactly the key used in aws_catalog.json. Example: 'iam:CreateUser'.",
+          "pattern": "^[a-zA-Z0-9-]+:[A-Za-z0-9]+$"
+        },
+        "service": {
+          "type": "string",
+          "description": "AWS service prefix (lowercase). Matches the 'service' field in aws_catalog.json. Example: 'iam'."
+        },
+        "name": {
+          "type": "string",
+          "description": "Action name without the service prefix. Matches the 'name' field in aws_catalog.json. Example: 'CreateUser'."
+        },
+        "access_level": {
+          "type": "string",
+          "description": "AWS-defined access level for this action, as sourced from the catalog. One of: 'List', 'Read', 'Write', 'Tagging', 'Permissions management'.",
+          "enum": ["List", "Read", "Write", "Tagging", "Permissions management"]
+        },
+        "resource_types": {
+          "type": "array",
+          "description": "Resource types this action operates on, as sourced from the catalog. May be an empty array if none are defined.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "condition_keys": {
+          "type": "array",
+          "description": "IAM condition keys applicable to this action, as sourced from the catalog. May be an empty array.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependent_actions": {
+          "type": "array",
+          "description": "Other IAM actions that must also be granted for this action to succeed, as sourced from the catalog. May be an empty array.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "string",
+          "description": "Lifecycle status of this review item. Allowed values and their meanings:\n- 'unclassified'   : Default state; action has not yet been reviewed.\n- 'classified'     : Review complete; action has been mapped to one or more capabilities.\n- 'deferred'       : Review intentionally postponed; may be revisited in a future cycle.\n- 'needs-research' : Insufficient information to classify; further investigation required.\n- 'not-applicable' : Action is not relevant to the IAM risk model (e.g., read-only metadata).",
+          "enum": [
+            "unclassified",
+            "classified",
+            "deferred",
+            "needs-research",
+            "not-applicable"
+          ]
+        },
+        "candidate_capabilities": {
+          "type": "array",
+          "description": "ADVISORY ONLY. Suggested capability names that this action might belong to, inferred by automated heuristics. This field must NOT be treated as reviewed or authoritative detection logic. Human review is required before any entry here is promoted to the classification layer.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "description": "Free-form text for reviewer annotations, context, or open questions. May be an empty string. Not used by automated tooling."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Machine-generated or human-supplied explanation of why this action appeared in the review queue. Example: 'New action found in catalog version 2 not present in version 1'. May be an empty string."
+        }
+      }
+    }
+  }
+}

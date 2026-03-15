@@ -75,6 +75,22 @@ class EscalationResult(BaseModel):
     detected_actions: list[str] = Field(
         ..., description="List of risky actions found in the policy."
     )
+    unknown_actions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Actions not present in any reviewed risk category or classification file. "
+            "These are honest unknowns — not confirmed safe, not confirmed risky. "
+            "Added to review_queue.json for human triage."
+        ),
+    )
+    composite_findings: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Multi-capability attack patterns detected by the composite rule engine. "
+            "Each entry is a serialised CompositeFinding dict with keys: rule_id, title, "
+            "severity, confidence, contributing_actions, rationale, confidence_explanation."
+        ),
+    )
     findings: list[EscalationFinding] = Field(
         ..., description="Detailed finding for each detected risky action."
     )

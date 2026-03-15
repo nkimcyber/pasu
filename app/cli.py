@@ -8,13 +8,14 @@ Usage:
 """
 
 import argparse
-import importlib.metadata
 import io
 import json
 import os
 import re
 import sys
+import textwrap
 
+from app.version import get_version
 from app.analyzer import (
     HIGH_RISK_ACTIONS,
     MEDIUM_RISK_ACTIONS,
@@ -146,20 +147,13 @@ def _print_banner() -> None:
     if not _supports_color():
         return
 
-    try:
-        version = importlib.metadata.version("pasu")
-    except importlib.metadata.PackageNotFoundError:
-        version = "dev"
-
-    n_high   = len(HIGH_RISK_ACTIONS)
-    n_medium = len(MEDIUM_RISK_ACTIONS)
-    n_total  = n_high + n_medium + STRUCTURAL_RULE_COUNT
+    version = get_version()
 
     C = "\033[36m"   # cyan   — gate structure
-    B = "\033[1m"    # bold   — PASU name (\033[1m immediately before text, nothing else)
+    B = "\033[1m"    # bold   — PASU name
     R = "\033[0m"    # reset
     Y = "\033[33m"   # yellow — tagline
-    D = "\033[2m"    # dim    — version / rule count
+    D = "\033[2m"    # dim    — version
 
     gate = [
         f"{C}============================{R}",
@@ -175,7 +169,6 @@ def _print_banner() -> None:
     for line in gate:
         print(line)
     print(f"  {D}pasu v{version}{R}  {Y}Cloud IAM Security Guard{R}")
-    print(f"  {D}[ {n_total} rules  {n_high} high  {n_medium} medium ]{R}")
 
 
 # ── File loading ──────────────────────────────────────────────────────────────
@@ -235,7 +228,33 @@ def _print_explain(result) -> None:
         print(f"  • {item}")
 
 
-def _print_escalate(result) -> None:
+def _extract_wildcard_actions(policy_json: str) -> list[str]:
+    """Return wildcard action patterns from Allow statements (e.g. '*', 'iam:*', 's3:*').
+
+    These patterns have unknown scope and belong in the Needs Review section,
+    not in confirmed risky findings.
+    """
+    try:
+        parsed = json.loads(policy_json)
+    except Exception:
+        return []
+    seen: set[str] = set()
+    wildcards: list[str] = []
+    for stmt in parsed.get("Statement", []):
+        if stmt.get("Effect") != "Allow":
+            continue
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        for action in actions:
+            lower = action.lower()
+            if "*" in lower and lower not in seen:
+                seen.add(lower)
+                wildcards.append(action)
+    return sorted(wildcards)
+
+
+def _print_escalate(result, policy_json: str | None = None) -> None:
     risk_code = _risk_color(result.risk_level)
     print(_header("Privilege Escalation Report"))
     risk_label = _color(result.risk_level, _BOLD + risk_code)
@@ -244,10 +263,85 @@ def _print_escalate(result) -> None:
     print(_section("Summary"))
     print(f"  {result.summary}")
 
-    if result.detected_actions:
-        print(_section("Detected Risky Actions"))
-        for action in result.detected_actions:
+    # Segment detected actions by evidence quality.
+    # HIGH_RISK_ACTIONS are reviewed and confirmed dangerous → Confirmed Risky Actions.
+    # MEDIUM_RISK_ACTIONS are context-dependent → Needs Review.
+    high_lower: set[str] = {a.lower() for a in HIGH_RISK_ACTIONS}
+    confirmed = [a for a in result.detected_actions if a.lower() in high_lower]
+    needs_review_detected = [
+        a for a in result.detected_actions if a.lower() not in high_lower
+    ]
+
+    # Wildcard patterns from the raw policy have unknown scope → Needs Review.
+    wildcard_actions: list[str] = (
+        _extract_wildcard_actions(policy_json) if policy_json else []
+    )
+
+    if confirmed:
+        print(_section("Confirmed Risky Actions"))
+        print("  Reviewed classification — confirmed dangerous by security research:")
+        for action in confirmed:
             print(f"  • {_color(action, risk_code)}")
+
+    # Unknown/unclassified actions are shown separately so users cannot
+    # mistake them for either safe or confirmed-risky.
+    unknown_actions: list[str] = getattr(result, "unknown_actions", [])
+
+    if needs_review_detected or wildcard_actions or unknown_actions:
+        print(_section("Needs Review"))
+        print("  Not confirmed risky — unclassified or context-dependent:")
+        for action in needs_review_detected:
+            print(f"  • {_color(action, _YELLOW)}  [reviewed: medium-risk — context-dependent]")
+        for action in wildcard_actions:
+            print(f"  • {_color(action, _YELLOW)}  [catalog: wildcard scope — actions not individually risk-assessed]")
+        for action in unknown_actions:
+            print(
+                f"  • {_color(action, _YELLOW)}  "
+                "[unclassified: absent from all reviewed risk categories — "
+                "added to review_queue.json for triage]"
+            )
+
+    composite_findings: list[dict] = getattr(result, "composite_findings", [])
+    if composite_findings:
+        _SEV_COLOR = {
+            "critical": _RED,
+            "high": _RED,
+            "medium": _YELLOW,
+            "low": _GREEN,
+        }
+        # All field labels align to _COL characters so values start in one column.
+        # "    Permissions:  " = 4 indent + 12 label + 1 colon + 1 space = 18 chars
+        _COL = 18
+
+        def _field(label: str, value: str) -> str:
+            prefix = f"    {label}:"
+            return f"{prefix}{' ' * (_COL - len(prefix))}{value}"
+
+        _indent = " " * _COL
+
+        print(_section("High-Risk Permission Patterns"))
+        for f in composite_findings:
+            sev = f.get("severity", "")
+            sev_code = _SEV_COLOR.get(sev, _WHITE)
+            rule_label = _color(f"{f['rule_id']}  {f['title']}", _BOLD + sev_code)
+            n_required = len(f.get("matched_required", []))
+            pattern_type = (
+                "Risky in combination" if n_required >= 2
+                else "High-risk on its own"
+            )
+            print(f"\n  {rule_label}")
+            print(f"  {pattern_type}")
+            print(_field("Risk", sev.upper()))
+            print(_field("Confidence", f["confidence"]))
+            print(_field("Permissions", ", ".join(f["contributing_actions"])))
+            rationale = f.get("rationale", "")
+            if rationale:
+                wrapped = textwrap.wrap(rationale, width=88 - _COL)
+                print(_field("Why", wrapped[0]))
+                for line in wrapped[1:]:
+                    print(f"{_indent}{line}")
+            if f.get("confidence_explanation"):
+                print(_field("Evidence", f["confidence_explanation"]))
 
     if result.findings:
         print(_section("Findings"))
@@ -257,10 +351,10 @@ def _print_escalate(result) -> None:
             print(f"      Escalation path:  {finding.escalation_path}")
 
 
-def _print_scan(explain_result, escalate_result) -> None:
+def _print_scan(explain_result, escalate_result, policy_json: str | None = None) -> None:
     _print_explain(explain_result)
     print()
-    _print_escalate(escalate_result)
+    _print_escalate(escalate_result, policy_json=policy_json)
 
 
 # ── JSON output formatters ────────────────────────────────────────────────────
@@ -278,6 +372,8 @@ def _escalate_to_json(result, rule_findings) -> dict:
         "risk_level": result.risk_level,
         "risk_score": result.risk_score,
         "detected_actions": result.detected_actions,
+        "unknown_actions": getattr(result, "unknown_actions", []),
+        "composite_findings": getattr(result, "composite_findings", []),
         "findings": [f.model_dump() for f in result.findings],
         "rule_findings": [f.model_dump() for f in rule_findings],
         "summary": result.summary,
@@ -311,10 +407,7 @@ def _build_sarif(policy_path: str, rule_findings, escalate_result) -> dict:
     Returns:
         SARIF 2.1.0 dict ready for json.dumps().
     """
-    try:
-        version = importlib.metadata.version("pasu")
-    except importlib.metadata.PackageNotFoundError:
-        version = "0.2.0"
+    version = get_version()
 
     _SEV = {"high": "error", "medium": "warning", "low": "note"}
 
@@ -448,7 +541,7 @@ def cmd_escalate(args: argparse.Namespace) -> None:
     elif args.format == "sarif":
         print(json.dumps(_build_sarif(args.file, rule_findings, result), indent=2))
     else:
-        _print_escalate(result)
+        _print_escalate(result, policy_json=policy_json)
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
@@ -485,7 +578,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     elif args.format == "sarif":
         print(json.dumps(_build_sarif(args.file, rule_findings, escalate_result), indent=2))
     else:
-        _print_scan(explain_result, escalate_result)
+        _print_scan(explain_result, escalate_result, policy_json=policy_json)
 
 
 # ── Fix formatters and handler ────────────────────────────────────────────────
@@ -559,8 +652,8 @@ def _print_fix(result, output_path: str | None, original_score: int, fixed_score
         )
         if remaining_medium_actions:
             print(
-                f"  • {_color('NOTE', _CYAN)}: Medium-risk actions remain because "
-                "auto-removing them may break intended access:"
+                f"  • {_color('NOTE', _CYAN)}: Reviewed medium-risk actions remain "
+                "(not auto-removed — risk is context-dependent):"
             )
             for statement_index, actions in remaining_medium_actions:
                 joined_actions = ", ".join(actions)

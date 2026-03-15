@@ -1333,6 +1333,100 @@ class TestCliJsonOutput:
             json.loads(raw)
 
 
+# ── CLI text output structure / snapshot tests ────────────────────────────────
+
+_HIGH_RISK_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}],
+})
+
+_MEDIUM_RISK_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "*"}],
+})
+
+_MIXED_RISK_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow",
+                   "Action": ["iam:PassRole", "sts:AssumeRole"],
+                   "Resource": "*"}],
+})
+
+_WILDCARD_SCOPE_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}],
+})
+
+
+class TestCliTextOutputStructure:
+    """Snapshot-style tests: verify section presence, order, and category placement."""
+
+    def test_high_risk_action_appears_in_confirmed_section(self, tmp_path):
+        """iam:PassRole (HIGH) must appear under 'Confirmed Risky Actions'."""
+        from app.cli import cmd_escalate
+        args = _make_args(tmp_path, "escalate", _HIGH_RISK_POLICY, fmt="text")
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        output = buf.getvalue()
+        assert "Confirmed Risky Actions" in output
+        # iam:PassRole must be in the confirmed region (before any Needs Review)
+        confirmed_idx = output.index("Confirmed Risky Actions")
+        needs_review_idx = output.find("Needs Review")
+        end = needs_review_idx if needs_review_idx != -1 else len(output)
+        confirmed_region = output[confirmed_idx:end]
+        assert "iam:passrole" in confirmed_region.lower()
+
+    def test_medium_risk_action_appears_in_needs_review_section(self, tmp_path):
+        """sts:AssumeRole (MEDIUM) must appear under 'Needs Review', not 'Confirmed Risky Actions'."""
+        from app.cli import cmd_escalate
+        args = _make_args(tmp_path, "escalate", _MEDIUM_RISK_POLICY, fmt="text")
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        output = buf.getvalue()
+        assert "Needs Review" in output
+        assert "Confirmed Risky Actions" not in output
+        assert "sts:assumerole" in output.lower()
+
+    def test_confirmed_section_precedes_needs_review_section(self, tmp_path):
+        """When both sections are present, Confirmed Risky Actions comes first."""
+        from app.cli import cmd_escalate
+        args = _make_args(tmp_path, "escalate", _MIXED_RISK_POLICY, fmt="text")
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        output = buf.getvalue()
+        assert "Confirmed Risky Actions" in output, "Expected 'Confirmed Risky Actions' section"
+        assert "Needs Review" in output, "Expected 'Needs Review' section"
+        assert output.index("Confirmed Risky Actions") < output.index("Needs Review")
+
+    def test_wildcard_action_appears_in_needs_review_not_confirmed(self, tmp_path):
+        """Wildcard patterns (e.g. 's3:*') must appear in Needs Review, not Confirmed Risky Actions."""
+        from app.cli import cmd_escalate
+        args = _make_args(tmp_path, "escalate", _WILDCARD_SCOPE_POLICY, fmt="text")
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        output = buf.getvalue()
+        assert "Needs Review" in output
+        assert "s3:*" in output
+        # s3:* must not appear inside a Confirmed Risky Actions block
+        confirmed_idx = output.find("Confirmed Risky Actions")
+        needs_review_idx = output.find("Needs Review")
+        if confirmed_idx != -1 and needs_review_idx != -1:
+            confirmed_region = output[confirmed_idx:needs_review_idx]
+            assert "s3:*" not in confirmed_region
+
+    def test_section_headers_present_in_escalate_report(self, tmp_path):
+        """The escalate text report must contain all three structural markers."""
+        from app.cli import cmd_escalate
+        args = _make_args(tmp_path, "escalate", _HIGH_RISK_POLICY, fmt="text")
+        with _capture_stdout() as buf:
+            cmd_escalate(args)
+        output = buf.getvalue()
+        assert "Privilege Escalation Report" in output
+        assert "Risk Level" in output
+        assert "Risk Score" in output
+        assert "Summary" in output
+
+
 # ── CLI --format sarif tests ──────────────────────────────────────────────────
 
 _SARIF_SCHEMA = (
@@ -1879,3 +1973,113 @@ class TestCalculateRiskScore:
         })
         score = calculate_risk_score(policy)
         assert score >= 10  # R006 alone = 10
+
+
+# ---------------------------------------------------------------------------
+# Messaging layer distinction tests (Task 3)
+# ---------------------------------------------------------------------------
+
+class TestMessagingLayerDistinctions:
+    """Regression tests for three-layer evidence vocabulary in user-facing text.
+
+    Verifies that:
+    - R003 findings use 'reviewed high-risk' (not 'dangerous') vocabulary.
+    - R004 findings use 'reviewed medium-risk' (not 'sensitive') vocabulary.
+    - Escalation summaries use reviewed-classification vocabulary.
+    - CLI fix output uses context-dependent wording for medium-risk actions.
+    - Unknown actions in the CLI appear in 'Needs Review', not 'Confirmed'.
+    """
+
+    # Eight high-risk actions → score 79 → risk_level "High"
+    _HIGH_RISK_ONLY_POLICY = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": [
+            "iam:PassRole", "iam:CreateRole", "iam:AttachRolePolicy",
+            "iam:PutRolePolicy", "iam:CreatePolicyVersion",
+            "iam:SetDefaultPolicyVersion", "sts:AssumeRole",
+            "iam:AddUserToGroup",
+        ], "Resource": "*"}],
+    })
+
+    # Two medium-risk-only actions → score 23 → risk_level "Medium"
+    # (iam:CreateAccessKey 4 + secretsmanager:GetSecretValue 4 + R001 10 + R005 5 = 23)
+    # Neither action is in HIGH_RISK_ACTIONS, so the summary must say "medium-risk".
+    _MEDIUM_RISK_ONLY_POLICY = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": [
+            "iam:CreateAccessKey", "secretsmanager:GetSecretValue",
+        ], "Resource": "*"}],
+    })
+
+    # Medium-risk action (not in HIGH_RISK_ACTIONS) → produces R004, kept by fix
+    _MEDIUM_RISK_R004_POLICY = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": ["iam:CreateAccessKey"], "Resource": "*"}],
+    })
+
+    def test_r003_title_uses_reviewed_high_risk_vocabulary(self):
+        """R003 finding titles must say 'Reviewed high-risk action', not 'Dangerous action'."""
+        from app.analyzer import analyze_policy_rules
+        findings = analyze_policy_rules(self._HIGH_RISK_ONLY_POLICY)
+        r003_titles = [f.title for f in findings if f.rule_id == "R003"]
+        assert r003_titles, "Expected at least one R003 finding for iam:PassRole"
+        for title in r003_titles:
+            assert "Reviewed high-risk action" in title, (
+                f"R003 title must use reviewed-classification vocabulary; got: {title!r}"
+            )
+            assert "Dangerous" not in title
+
+    def test_r004_title_uses_reviewed_medium_risk_vocabulary(self):
+        """R004 finding titles must say 'Reviewed medium-risk action', not 'Sensitive action'."""
+        from app.analyzer import analyze_policy_rules
+        findings = analyze_policy_rules(self._MEDIUM_RISK_R004_POLICY)
+        r004_titles = [f.title for f in findings if f.rule_id == "R004"]
+        assert r004_titles, "Expected at least one R004 finding for iam:CreateAccessKey"
+        for title in r004_titles:
+            assert "Reviewed medium-risk action" in title, (
+                f"R004 title must use reviewed-classification vocabulary; got: {title!r}"
+            )
+            assert "Sensitive" not in title
+
+    def test_escalation_summary_uses_reviewed_high_risk_vocabulary(self):
+        """Escalation summary for High risk must reference 'reviewed high-risk'."""
+        from app.analyzer import escalate_policy_local, risk_score_label, calculate_risk_score
+        score = calculate_risk_score(self._HIGH_RISK_ONLY_POLICY)
+        assert risk_score_label(score) == "High", (
+            f"Test setup error: expected High risk score, got {score}"
+        )
+        result = escalate_policy_local(self._HIGH_RISK_ONLY_POLICY)
+        assert result.risk_level == "High"
+        assert "reviewed high-risk" in result.summary, (
+            f"Escalation summary must use reviewed-classification vocabulary; got: {result.summary!r}"
+        )
+        assert "dangerous" not in result.summary.lower()
+
+    def test_escalation_summary_uses_reviewed_medium_risk_vocabulary(self):
+        """Escalation summary for Medium risk must reference 'reviewed medium-risk'."""
+        from app.analyzer import escalate_policy_local, risk_score_label, calculate_risk_score
+        score = calculate_risk_score(self._MEDIUM_RISK_ONLY_POLICY)
+        assert risk_score_label(score) == "Medium", (
+            f"Test setup error: expected Medium risk score, got {score}"
+        )
+        result = escalate_policy_local(self._MEDIUM_RISK_ONLY_POLICY)
+        assert result.risk_level == "Medium"
+        assert "reviewed medium-risk" in result.summary, (
+            f"Escalation summary must use reviewed-classification vocabulary; got: {result.summary!r}"
+        )
+        assert "sensitive" not in result.summary.lower()
+
+    def test_fix_output_medium_risk_note_uses_context_dependent_wording(self):
+        """_print_fix must say 'context-dependent' for medium-risk retained actions."""
+        from app.cli import _print_fix
+        from app.analyzer import fix_policy_local, calculate_risk_score
+        result = fix_policy_local(self._MEDIUM_RISK_R004_POLICY)
+        original_score = calculate_risk_score(self._MEDIUM_RISK_R004_POLICY)
+        import json as _json
+        fixed_score = calculate_risk_score(_json.dumps(result.fixed_policy))
+        with _capture_stdout() as buf:
+            _print_fix(result, output_path=None, original_score=original_score, fixed_score=fixed_score)
+        output = buf.getvalue()
+        assert "context-dependent" in output.lower(), (
+            "Medium-risk retention note must explain risk is context-dependent"
+        )

@@ -13,7 +13,7 @@ Pasu is designed for engineers who want a fast, self-serve IAM security workflow
 
 ### What Pasu tries to do well
 - Explain what an IAM policy actually allows
-- Detect risky permissions and privilege escalation paths
+- Detect risky permissions and escalation-related patterns
 - Show a clear risk score
 - Generate a safer **proposed policy**
 - Tell users what still requires manual review
@@ -39,7 +39,16 @@ Pasu should be useful on day one:
 - `pasu escalate --file policy.json` — Detect privilege escalation risks
 - `pasu scan --file policy.json` — Combined explain + escalate report
 - `pasu fix --file policy.json` — Generate a safer **proposed policy**
-- All commands support: `--ai`, `--format text|json|sarif`, `-q`
+
+#### Current CLI option support
+- `explain`, `escalate`, `scan`
+  - `--ai`
+  - `--format text|json|sarif`
+- `fix`
+  - `--format text|json`
+  - `--output` / `-o`
+- Global option
+  - `-q` / `--quiet`
 
 #### Local mode (free, no API key required)
 - 30 detection rules
@@ -49,13 +58,15 @@ Pasu should be useful on day one:
 - Risk scoring from 0–100 with a visual bar
 - Human-readable explanations
 - Conservative policy fixing
-- JSON and SARIF output for CI/CD integration
+- JSON and SARIF output for `explain`, `escalate`, and `scan`
+- JSON output for `fix`
 
 #### AI mode (`--ai`, requires Anthropic API key)
 - Claude Haiku for deeper analysis
 - More detailed natural-language explanations
-- Escalation-path-oriented output
-- Local analysis first, AI only when needed
+- Escalation-path-oriented output for risky policies
+- `escalate --ai` performs local reviewed-action detection first and skips Claude when no reviewed high-risk actions are found
+- `explain --ai` and AI-backed `scan` use Claude for richer output rather than a local-first fallback
 
 #### Infrastructure
 - 159 pytest tests passing
@@ -64,7 +75,7 @@ Pasu should be useful on day one:
 - Example GitHub Actions workflow for users
 - Rule/scoring/fix data externalized into packaged config files
 - Canonical AWS action catalog snapshot stored in-repo
-- Local AWS catalog sync/diff script implemented and validated
+- Local AWS catalog sync/diff and review-queue generation implemented and validated
 
 ---
 
@@ -72,23 +83,39 @@ Pasu should be useful on day one:
 
 Phase 1 moved the local analyzer away from a fully hardcoded rule layout.
 
-### Current packaged analyzer data
+### Current analyzer rule/data layers
+
+#### Core risk and fix configuration
 - `app/rules/risky_actions.yaml`
 - `app/rules/scoring.yaml`
 - `app/rules/fix_profiles.yaml`
+
+#### Reviewed classification and capability vocabulary
+- `app/rules/action_classification.yaml`
+- `app/rules/capabilities.yaml`
+
+#### Composite detection layer
+- `app/rules/composite_detections.yaml`
+
+#### Catalog and generated review data
 - `app/data/aws_catalog.json`
+- `app/data/review_queue.json`
 
 ### What this changed
 - Detection taxonomy is easier to update and review
 - Scoring changes are separated from analyzer logic
 - Fix profiles are easier to expand without large code edits
+- Reviewed action classification is now distinct from raw AWS catalog ingestion
+- Capability names are controlled through a shared vocabulary
+- Composite detections can be added without embedding every relationship in Python logic
 - Packaging now explicitly includes rule/data files
 - CLI and API contracts remain stable
 
-### What Phase 1 did **not** do
-- It did not add a live account audit mode
-- It did not auto-classify new AWS actions into risk tiers
-- It did not change Pasu into a hosted cloud platform
+### Current boundary of this architecture
+- Pasu still does **not** auto-classify new AWS actions into risk tiers
+- Reviewed classifications remain a human-governed layer
+- Composite detections currently act primarily as review/evidence logic, not as a fully separate end-user reporting surface across every command
+- Pasu is still a local-first CLI, not a hosted cloud platform
 
 ---
 
@@ -102,6 +129,11 @@ Phase 1.5 adds the local foundation for keeping packaged AWS action metadata cur
 
 ### Canonical snapshot
 - `app/data/aws_catalog.json`
+
+### Review workflow outputs
+- `app/data/review_queue.json`
+- `reports/aws_catalog_diff.json`
+- `reports/aws_catalog_diff.md`
 
 ### Schema v1
 Top-level structure:
@@ -126,9 +158,8 @@ Each action entry stores:
 - Discovers service prefixes
 - Extracts action metadata into schema v1
 - Writes canonical snapshot to `app/data/aws_catalog.json`
-- Generates review reports:
-  - `reports/aws_catalog_diff.json`
-  - `reports/aws_catalog_diff.md`
+- Builds a review queue of actions that still require human classification
+- Generates diff/report outputs for both catalog changes and review-queue changes
 
 ### Current diff/report behavior
 Tracks:
@@ -138,11 +169,15 @@ Tracks:
 - changed resource types
 - changed condition keys
 - changed dependent actions
+- review queue additions
+- review queue removals
+- review queue status movement
 
 Also reports:
 - `new_unclassified_actions`
 - `services_with_new_unclassified_actions`
 - `count_summary`
+- `queue_diff`
 
 ### Important current boundary
 This foundation is intentionally **review-based**.
@@ -158,7 +193,8 @@ It does **not** promise a perfect final least-privilege policy.
 It generates a safer **proposed policy** and explains what still needs review.
 
 ### Current fix behavior
-- Removes obvious high-risk actions when safe to do so
+- Removes reviewed high-risk actions only when the classification confidence gate allows automated removal
+- Keeps some actions unchanged when no reviewed classification exists, the action is marked not-applicable, or the confidence is too low for safe auto-removal
 - Keeps some medium-risk actions if auto-removing them may break intended access
 - Keeps wildcard resources when Pasu cannot safely narrow them without resource-specific context
 - Adds warnings and notes to explain why some broad permissions remain
@@ -192,15 +228,16 @@ The output from `pasu fix` is designed to be:
 ## 6. Example `pasu fix` behavior
 
 A typical `pasu fix` result may:
-- remove `iam:PassRole`
-- remove `lambda:CreateFunction`
-- remove `lambda:UpdateFunctionCode`
+- remove `iam:PassRole` when a reviewed classification record exists and the confidence gate permits auto-removal
+- remove `lambda:CreateFunction` when its reviewed classification permits auto-removal
+- remove `lambda:UpdateFunctionCode` when its reviewed classification permits auto-removal
 - keep `sts:AssumeRole`
 - keep `ec2:DescribeInstances`
 - keep `secretsmanager:GetSecretValue`
 - keep `ssm:GetParameter`
 - keep `Resource: "*"` when safe narrowing is not possible
 - insert `"TODO:specify-needed-actions"` when all risky actions in a statement were removed
+- keep a risky action and emit a manual-review note when the reviewed classification gate blocks automated removal
 
 That is expected behavior.
 
@@ -265,6 +302,8 @@ Completed locally:
 - Implemented local sync script
 - Implemented canonical snapshot writing
 - Implemented diff report generation
+- Implemented review-queue generation
+- Implemented review-queue diff generation
 - Implemented unclassified action reporting
 - Validated local `--dry-run` and `--write`
 - Validated action-only precision for canonical snapshot
@@ -303,7 +342,7 @@ Pasu should prefer a reviewable **proposed policy** over an overconfident or des
 Results should be understandable even for people who are not deep IAM experts.
 
 ### 5. Clear machine-readable output matters too
-JSON and SARIF should remain useful for automation and CI/CD pipelines.
+JSON and SARIF should remain useful for automation and CI/CD pipelines where supported by the command.
 
 ### 6. One cloud problem at a time
 Depth and correctness are more important than claiming broad cloud coverage too early.
@@ -336,5 +375,7 @@ This public specification is intentionally focused on:
 
 Additional current notes:
 - `app/data/aws_catalog.json` is now a real canonical snapshot, not just a placeholder layer.
-- The next meaningful backend step is GitHub Actions automation for scheduled AWS catalog refresh and diff generation.
+- `app/data/review_queue.json` is part of the review workflow and should be treated as generated review-state data rather than a replacement for reviewed classification.
+- The next meaningful backend step is GitHub Actions automation for scheduled AWS catalog refresh, diff generation, and review-queue updates.
 - Risk-tier assignment for new AWS actions remains intentionally human-reviewed.
+- Some API metadata in the codebase still carries legacy `IAM Analyzer` naming/version fields and should be aligned with Pasu branding before the next release to avoid documentation drift.

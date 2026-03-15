@@ -35,6 +35,8 @@ from urllib.parse import urljoin
 
 import httpx
 
+from app.review_status import ReviewStatus
+
 LOGGER = logging.getLogger("sync_aws_catalog")
 
 INDEX_URL = (
@@ -47,6 +49,7 @@ REPO_ROOT = SCRIPT_DIR.parent
 
 CANONICAL_CATALOG_PATH = REPO_ROOT / "app" / "data" / "aws_catalog.json"
 RISKY_ACTIONS_PATH = REPO_ROOT / "app" / "rules" / "risky_actions.yaml"
+REVIEW_QUEUE_PATH = REPO_ROOT / "app" / "data" / "review_queue.json"
 DIFF_JSON_PATH = REPO_ROOT / "reports" / "aws_catalog_diff.json"
 DIFF_MD_PATH = REPO_ROOT / "reports" / "aws_catalog_diff.md"
 
@@ -518,6 +521,124 @@ def diff_catalogs(previous: dict[str, Any] | None, current: dict[str, Any], clas
     }
 
 
+def diff_review_queues(
+    previous_queue: dict[str, Any] | None,
+    current_queue: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute the diff between two review queue snapshots.
+
+    Compares the set of action keys present in the previous on-disk queue
+    against those in the newly generated queue.  Only action keys are compared;
+    field-level changes within an existing item are not tracked here.
+
+    Args:
+        previous_queue: Parsed ``review_queue.json`` from before this run, or
+            ``None`` when no prior file exists.
+        current_queue: The review queue produced by :func:`generate_review_queue`
+            in this run.
+
+    Returns:
+        A dict with the following keys:
+
+        ``count_summary``
+            Scalar counts for previous/current queue size and delta.
+        ``new_unclassified_actions``
+            Sorted list of action keys that entered the queue this run.
+        ``removed_from_queue``
+            Sorted list of action keys that left the queue this run.
+        ``services_with_new_unclassified_actions``
+            Sorted list of service prefixes that have at least one new entry.
+        ``new_unclassified_count_by_service``
+            Dict mapping each service prefix to its count of new queue entries,
+            sorted by service name for stable output.
+    """
+    prev_items: list[dict[str, Any]] = (previous_queue or {}).get("items", [])
+    curr_items: list[dict[str, Any]] = current_queue.get("items", [])
+
+    prev_keys: set[str] = {item["action"] for item in prev_items}
+    curr_keys: set[str] = {item["action"] for item in curr_items}
+
+    new_to_queue: list[str] = sorted(curr_keys - prev_keys)
+    removed_from_queue: list[str] = sorted(prev_keys - curr_keys)
+
+    services_with_new: list[str] = sorted({action.split(":", 1)[0] for action in new_to_queue})
+
+    count_by_service: dict[str, int] = {}
+    for action in new_to_queue:
+        svc = action.split(":", 1)[0]
+        count_by_service[svc] = count_by_service.get(svc, 0) + 1
+
+    return {
+        "count_summary": {
+            "previous_queue_count": len(prev_keys),
+            "current_queue_count": len(curr_keys),
+            "new_to_queue_count": len(new_to_queue),
+            "removed_from_queue_count": len(removed_from_queue),
+        },
+        "new_unclassified_actions": new_to_queue,
+        "removed_from_queue": removed_from_queue,
+        "services_with_new_unclassified_actions": services_with_new,
+        "new_unclassified_count_by_service": dict(sorted(count_by_service.items())),
+    }
+
+
+def generate_review_queue(
+    catalog: dict[str, Any],
+    classified_actions: set[str],
+) -> dict[str, Any]:
+    """Build the review queue: all catalog actions not yet in the classification mapping.
+
+    Each output item carries only catalog facts (action key, service, name,
+    access_level, resource_types, condition_keys, dependent_actions).  No risk
+    judgment is applied: status is always ``unclassified``, and
+    ``candidate_capabilities`` is always an empty list.
+
+    Ordering is deterministic: items are sorted lexicographically by action key
+    (which is equivalent to sorting by service prefix, then action name).
+
+    Args:
+        catalog: Parsed aws_catalog.json structure.
+        classified_actions: Lowercase-normalised set of action keys that are
+            already present in the reviewed classification mapping (as returned
+            by :func:`load_risky_actions`).
+
+    Returns:
+        A dict conforming to ``review_queue.schema.json``.
+    """
+    catalog_actions: dict[str, Any] = catalog.get("actions", {})
+    catalog_version: int = catalog.get("version", 0)
+    reason = (
+        f"Action exists in catalog version {catalog_version} "
+        "but is not present in the reviewed classification mapping."
+    )
+
+    items: list[dict[str, Any]] = []
+    for action_key in sorted(catalog_actions.keys()):
+        if action_key.lower() in classified_actions:
+            continue
+        meta = catalog_actions[action_key]
+        service_part, name_part = (action_key.split(":", 1) + [""])[:2]
+        items.append({
+            "action": action_key,
+            "service": meta.get("service", service_part),
+            "name": meta.get("name", name_part),
+            "access_level": meta.get("access_level", ""),
+            "resource_types": list(meta.get("resource_types", [])),
+            "condition_keys": list(meta.get("condition_keys", [])),
+            "dependent_actions": list(meta.get("dependent_actions", [])),
+            "status": ReviewStatus.UNCLASSIFIED,
+            "candidate_capabilities": [],
+            "notes": "",
+            "reason": reason,
+        })
+
+    return {
+        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "source_catalog_version": catalog_version,
+        "items": items,
+    }
+
+
 def render_markdown_report(diff: dict[str, Any]) -> str:
     """Render a human-readable Markdown diff report."""
     summary = diff["count_summary"]
@@ -550,6 +671,10 @@ def render_markdown_report(diff: dict[str, Any]) -> str:
         lines.extend(["No changed actions.", ""])
     _append_markdown_list(lines, "New unclassified actions", diff["new_unclassified_actions"])
     _append_markdown_list(lines, "Services with new unclassified actions", diff["services_with_new_unclassified_actions"])
+
+    if "queue_diff" in diff:
+        lines.extend(_render_queue_diff_section(diff["queue_diff"]))
+
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -561,6 +686,45 @@ def _append_markdown_list(lines: list[str], title: str, items: list[str]) -> Non
         lines.append("")
     else:
         lines.extend([f"No {title.lower()}.", ""])
+
+
+def _render_queue_diff_section(queue_diff: dict[str, Any]) -> list[str]:
+    """Render the review queue diff as Markdown lines.
+
+    Returns a list of lines (without a trailing newline) ready to be spliced
+    into the parent report.
+    """
+    qs = queue_diff["count_summary"]
+    lines: list[str] = [
+        "## Review Queue Diff",
+        "",
+        "### Queue Count Summary",
+        "",
+        f"- Previous queue count: {qs['previous_queue_count']}",
+        f"- Current queue count: {qs['current_queue_count']}",
+        f"- New to queue: {qs['new_to_queue_count']}",
+        f"- Removed from queue: {qs['removed_from_queue_count']}",
+        "",
+    ]
+
+    _append_markdown_list(lines, "New unclassified actions (queue)", queue_diff["new_unclassified_actions"])
+    _append_markdown_list(lines, "Removed from queue", queue_diff["removed_from_queue"])
+    _append_markdown_list(
+        lines,
+        "Services with new unclassified actions (queue)",
+        queue_diff["services_with_new_unclassified_actions"],
+    )
+
+    lines.extend(["### New unclassified actions by service", ""])
+    count_by_service: dict[str, int] = queue_diff.get("new_unclassified_count_by_service", {})
+    if count_by_service:
+        for svc, count in count_by_service.items():
+            lines.append(f"- `{svc}`: {count}")
+        lines.append("")
+    else:
+        lines.extend(["No new unclassified actions by service.", ""])
+
+    return lines
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -668,11 +832,22 @@ def main() -> None:
         current_catalog = build_catalog(client)
 
     previous_catalog = load_json_file(CANONICAL_CATALOG_PATH)
+    previous_queue = load_json_file(REVIEW_QUEUE_PATH)
     classified_actions = load_risky_actions(RISKY_ACTIONS_PATH)
     diff = diff_catalogs(previous_catalog, current_catalog, classified_actions)
 
+    review_queue = generate_review_queue(current_catalog, classified_actions)
+    diff["queue_diff"] = diff_review_queues(previous_queue, review_queue)
+
     write_json(DIFF_JSON_PATH, diff)
     write_text(DIFF_MD_PATH, render_markdown_report(diff))
+
+    write_json(REVIEW_QUEUE_PATH, review_queue)
+    LOGGER.info(
+        "Wrote review queue: %s (%d unclassified items)",
+        REVIEW_QUEUE_PATH,
+        len(review_queue["items"]),
+    )
 
     if args.write:
         validate_catalog(current_catalog, previous_catalog, diff)
@@ -684,13 +859,14 @@ def main() -> None:
     LOGGER.info("Wrote diff JSON report: %s", DIFF_JSON_PATH)
     LOGGER.info("Wrote diff Markdown report: %s", DIFF_MD_PATH)
     LOGGER.info(
-        "Summary: prev=%d current=%d new=%d removed=%d changed=%d new_unclassified=%d",
+        "Summary: prev=%d current=%d new=%d removed=%d changed=%d new_unclassified=%d queue_items=%d",
         diff["count_summary"]["previous_action_count"],
         diff["count_summary"]["current_action_count"],
         diff["count_summary"]["new_action_count"],
         diff["count_summary"]["removed_action_count"],
         diff["count_summary"]["changed_action_count"],
         diff["count_summary"]["new_unclassified_action_count"],
+        len(review_queue["items"]),
     )
 
 

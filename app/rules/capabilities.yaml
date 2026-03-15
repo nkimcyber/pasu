@@ -1,0 +1,50 @@
+{
+  "_governance": {
+    "schema_version": 1,
+    "authority": "app/capabilities.py is the single programmatic reference for this vocabulary. All code that validates capability names must import from there.",
+    "adding_new_capabilities": "New capability names MUST be added to the 'capabilities' object in this file before they are used anywhere else. Do not invent ad-hoc names in classification records, candidate_capabilities fields, or detection rules. Open a tracked review to add new entries.",
+    "naming_convention": "Lowercase kebab-case. Names describe the *class of risk behaviour*, not a specific AWS service (e.g. 'credential-issuance', not 'iam-access-key-creation')."
+  },
+  "capabilities": {
+    "privilege-delegation": {
+      "description": "The action allows passing or delegating an IAM role to an AWS service or principal, enabling the recipient to act with that role's permissions.",
+      "risk_note": "Core privilege escalation vector; almost always combined with a compute or serverless action to materialise the privilege gain."
+    },
+    "policy-modification": {
+      "description": "The action creates, attaches, modifies, or deletes IAM policies or inline policies, directly altering what principals are permitted to do.",
+      "risk_note": "Grants the ability to elevate any principal in the account to arbitrary permissions, including AdministratorAccess."
+    },
+    "credential-issuance": {
+      "description": "The action generates or rotates persistent or temporary credentials (access keys, service-specific credentials, signing certificates) for an IAM principal.",
+      "risk_note": "Credential material can be exfiltrated for persistent out-of-band access that survives session expiry."
+    },
+    "compute-with-role": {
+      "description": "The action launches EC2-style compute (instances, containers, Batch jobs, ECS tasks) with an associated IAM instance profile or task role, executing arbitrary code under that role's permissions.",
+      "risk_note": "Commonly used to assume a high-privilege role indirectly by attaching it to newly launched compute."
+    },
+    "serverless-with-role": {
+      "description": "The action creates or modifies a serverless function or workflow (Lambda, Step Functions, EventBridge Pipes) with an associated execution role, enabling arbitrary code execution under that role.",
+      "risk_note": "Allows code injection into existing functions or deployment of new functions with elevated execution roles."
+    },
+    "public-exposure": {
+      "description": "The action can make a resource (S3 bucket, EBS snapshot, AMI, ECR image, SQS queue, etc.) publicly accessible or broadly accessible across all AWS accounts.",
+      "risk_note": "Primary data-exfiltration path via misconfigured resource policies, ACLs, or public sharing APIs."
+    },
+    "cross-account-trust": {
+      "description": "The action modifies trust policies, resource-based policies, RAM shares, or other configurations that grant principals from a different AWS account access to resources in this account.",
+      "risk_note": "Enables lateral movement between accounts without a conventional role assumption and can persist across account boundaries."
+    },
+    "secret-read": {
+      "description": "The action retrieves plaintext secret material such as Secrets Manager secret values, SSM SecureString parameters, or KMS-decrypted ciphertext.",
+      "risk_note": "Direct exfiltration of high-value credentials, API keys, database passwords, or encryption keys."
+    },
+    "data-read-sensitive": {
+      "description": "The action reads records from a general-purpose storage service (S3, DynamoDB, RDS snapshots, Redshift, etc.) that may contain sensitive business or personal data.",
+      "risk_note": "Broader than secret-read; covers bulk data access rather than targeted retrieval of pre-designated secret material."
+    },
+    "data-write-sensitive": {
+      "description": "The action writes, overwrites, or deletes records in a storage service in ways that could destroy, tamper with, or corrupt sensitive or regulated data.",
+      "risk_note": "Covers ransomware-style deletion attacks, audit-log tampering, and data integrity violations."
+    }
+  }
+}

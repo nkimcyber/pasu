@@ -1,0 +1,143 @@
+{
+  "_governance": {
+    "schema_version": 1,
+    "authority": "app/composite_detections.py is the programmatic loader and validator for this file. All rules are validated against app/capabilities.py (capability names) and the severity/confidence_logic enums defined in that module.",
+    "editing_policy": "Each composite rule must be the result of deliberate security review. Rule IDs are stable identifiers — once assigned, do not reuse an ID for a different rule. To retire a rule, mark it in a comment or remove it via a tracked PR.",
+    "id_convention": "Sequential COMP-NNN integers, zero-padded to three digits. IDs must be unique within this file.",
+    "separation_of_concerns": "This file contains rule metadata only. No matching engine logic, no action-level predicates, and no scoring weights belong here. Capability matching and finding construction are implemented separately in the detection engine (future task)."
+  },
+  "_field_reference": {
+    "id": {
+      "type": "string",
+      "pattern": "^COMP-[0-9]{3}$",
+      "description": "Stable unique rule identifier. Must not be reused or renumbered after a rule is published.",
+      "example": "COMP-001"
+    },
+    "title": {
+      "type": "string",
+      "description": "Short human-readable name for the composite detection. Used in finding titles and reports.",
+      "example": "Privilege Escalation via Compute"
+    },
+    "required_capabilities": {
+      "type": "array of string",
+      "items_enum": "see app/rules/capabilities.yaml :: capabilities keys",
+      "source": "app/capabilities.py :: CAPABILITY_NAMES",
+      "min_items": 1,
+      "description": "Capabilities that MUST all be present for this rule to fire. Every name must be a member of the controlled vocabulary in capabilities.yaml. An empty list is invalid — a rule with no required capabilities is not a composite detection."
+    },
+    "optional_capabilities": {
+      "type": "array of string",
+      "items_enum": "see app/rules/capabilities.yaml :: capabilities keys",
+      "source": "app/capabilities.py :: CAPABILITY_NAMES",
+      "description": "Capabilities that raise confidence or add context when present, but whose absence does not prevent the rule from firing. May be empty. Names must still come from the controlled vocabulary."
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["critical", "high", "medium", "low"],
+      "source": "app/composite_detections.py :: SEVERITY_LEVELS",
+      "description": "The assessed severity when this composite pattern is confirmed present. Reflects the potential blast radius, not the likelihood of exploitation."
+    },
+    "confidence_logic": {
+      "type": "string",
+      "enum": ["all-high", "weakest", "majority"],
+      "source": "app/composite_detections.py :: CONFIDENCE_LOGIC_VALUES",
+      "description": "How overall rule confidence is derived from the individual confidence scores of the contributing classified actions. Meanings: 'all-high' = rule fires at high confidence only when every contributing action has high confidence; 'weakest' = rule confidence equals the lowest individual action confidence; 'majority' = rule confidence is high if the majority of contributing actions are high. The matching engine (future task) must implement these semantics."
+    },
+    "rationale": {
+      "type": "string",
+      "description": "Explains what the capability combination means as an attack pattern — why this set of capabilities is dangerous together, not just individually. Required to be a non-empty string."
+    }
+  },
+  "rules": [
+    {
+      "id": "COMP-001",
+      "title": "Privilege Escalation via EC2 Compute",
+      "required_capabilities": ["privilege-delegation", "compute-with-role"],
+      "optional_capabilities": [],
+      "severity": "critical",
+      "confidence_logic": "weakest",
+      "rationale": "A principal that can both delegate an IAM role (privilege-delegation) and launch EC2 instances with that role attached (compute-with-role) can execute arbitrary code under any passable role's permissions. The combination is a complete privilege escalation chain: iam:PassRole enables the attachment, ec2:RunInstances materialises it into a running process. Neither capability alone completes the escalation."
+    },
+    {
+      "id": "COMP-002",
+      "title": "Privilege Escalation via Serverless Function",
+      "required_capabilities": ["privilege-delegation", "serverless-with-role"],
+      "optional_capabilities": [],
+      "severity": "critical",
+      "confidence_logic": "weakest",
+      "rationale": "A principal that can delegate an IAM role (privilege-delegation) and create or modify a Lambda function with that role as its execution role (serverless-with-role) can run arbitrary code under the execution role's permissions on demand. lambda:CreateFunction and lambda:UpdateFunctionCode are the concrete materialisation points; iam:PassRole is required to attach the role at creation time. Serverless escalation is often faster to exploit than EC2 because functions can be invoked immediately after creation."
+    },
+    {
+      "id": "COMP-003",
+      "title": "Direct IAM Policy Takeover",
+      "required_capabilities": ["policy-modification"],
+      "optional_capabilities": ["privilege-delegation"],
+      "severity": "critical",
+      "confidence_logic": "all-high",
+      "rationale": "A principal with policy-modification capability can rewrite managed or inline policies to grant arbitrary permissions to any principal, including itself. Unlike compute-based escalation paths, no additional action is required after the policy write — permissions take effect immediately. The optional privilege-delegation capability raises confidence that a full administrative takeover is intended rather than an isolated policy change."
+    },
+    {
+      "id": "COMP-004",
+      "title": "Persistent Credential Exfiltration",
+      "required_capabilities": ["credential-issuance"],
+      "optional_capabilities": ["secret-read"],
+      "severity": "high",
+      "confidence_logic": "weakest",
+      "rationale": "A principal that can issue new credentials (credential-issuance) creates a persistent out-of-band access path that survives session expiry, key rotation in the originating account, and MFA requirements. When combined with secret-read, the principal can also harvest existing credentials from Secrets Manager or SSM, establishing multiple independent exfiltration channels. Either capability alone is serious; together they indicate a deliberate credential-harvesting intent."
+    },
+    {
+      "id": "COMP-005",
+      "title": "Cross-Account Data Exfiltration",
+      "required_capabilities": ["cross-account-trust", "data-read-sensitive"],
+      "optional_capabilities": ["secret-read"],
+      "severity": "high",
+      "confidence_logic": "weakest",
+      "rationale": "A principal that can both modify cross-account trust relationships (cross-account-trust) and read sensitive data (data-read-sensitive) can exfiltrate data to an attacker-controlled account without needing traditional network egress. The cross-account-trust capability creates the exfiltration channel; data-read-sensitive provides the data. The optional secret-read capability, if present, indicates that high-value credentials may also be extracted through the same channel."
+    },
+    {
+      "id": "COMP-006",
+      "title": "Public Resource Exposure",
+      "required_capabilities": ["public-exposure"],
+      "optional_capabilities": ["data-read-sensitive", "data-write-sensitive"],
+      "severity": "high",
+      "confidence_logic": "majority",
+      "rationale": "A principal with public-exposure capability can make storage resources (S3 buckets, EBS snapshots, ECR images) accessible to the entire internet or all AWS accounts without authentication. The severity reflects the potential for mass data disclosure. When data-read-sensitive or data-write-sensitive are also present, the principal has both the means to expose resources and confirmed access to sensitive data, indicating a higher-impact exfiltration or tampering scenario."
+    },
+    {
+      "id": "COMP-007",
+      "title": "Persistent Backdoor via Policy Rewrite and Credential Establishment",
+      "required_capabilities": ["policy-modification", "credential-issuance"],
+      "optional_capabilities": ["privilege-delegation"],
+      "severity": "critical",
+      "confidence_logic": "all-high",
+      "rationale": "A principal that can both rewrite IAM policies and issue new credentials creates a durable, self-reinforcing backdoor that is harder to detect and remediate than compute-based escalation paths. Policy-modification allows granting arbitrary permissions to a freshly created identity; credential-issuance materialises that identity into a persistent access key that survives session expiry, key rotation of the originating credentials, and MFA requirement changes. Unlike COMP-001 and COMP-002, this backdoor leaves no running workload — it is entirely in the control plane and may go unnoticed until a credential audit is performed. The optional privilege-delegation capability indicates the adversary can additionally bind high-privilege roles to the backdoor identity, broadening its reach across the account."
+    },
+    {
+      "id": "COMP-008",
+      "title": "Shadow Admin via External Trust and Policy Grant",
+      "required_capabilities": ["cross-account-trust", "policy-modification"],
+      "optional_capabilities": ["privilege-delegation"],
+      "severity": "critical",
+      "confidence_logic": "all-high",
+      "rationale": "A principal that can both establish cross-account trust relationships and modify IAM policies can create a hidden administrative path controlled by an external AWS account. Policy-modification allows granting the external principal any permission set, including AdministratorAccess; cross-account-trust makes those permissions reachable from outside the account boundary, so the backdoor persists even after the originating principal's credentials are rotated or deactivated. This combination is distinct from COMP-005 (which exfiltrates data through a pre-existing trust channel) — here the adversary is building the trust channel and granting permissions in the same operation, creating a new administrative foothold rather than exploiting an existing one. The optional privilege-delegation capability enables the external principal to additionally assume compute or serverless execution roles inside the target account."
+    },
+    {
+      "id": "COMP-009",
+      "title": "Coordinated Intelligence Harvest",
+      "required_capabilities": ["secret-read", "data-read-sensitive"],
+      "optional_capabilities": [],
+      "severity": "high",
+      "confidence_logic": "weakest",
+      "rationale": "A principal with both secret-read and data-read-sensitive capability is positioned for a comprehensive intelligence harvest across two distinct data categories. Secret-read targets high-value credentials — database passwords, API tokens, encryption keys, third-party service secrets — while data-read-sensitive covers bulk business, customer, or regulated data records. Neither capability alone signals coordinated intent; a principal might legitimately hold one or the other in isolation. The combination indicates deliberate, multi-vector data collection: credentials for lateral movement or account access, and business data for exfiltration. The threat is high rather than critical because neither capability alone enables direct account-level privilege escalation."
+    },
+    {
+      "id": "COMP-010",
+      "title": "Ransomware and Double-Extortion Positioning",
+      "required_capabilities": ["data-read-sensitive", "data-write-sensitive"],
+      "optional_capabilities": ["public-exposure"],
+      "severity": "high",
+      "confidence_logic": "weakest",
+      "rationale": "A principal with confirmed access to both read and write sensitive data is structurally positioned for a ransomware or double-extortion attack. Data-read-sensitive enables exfiltration prior to destruction — the exfiltration phase of double-extortion; data-write-sensitive enables the destructive overwrite or deletion phase that makes data unavailable to the victim. When the optional public-exposure capability is also present, the principal can additionally publish exfiltrated data to the internet as leverage, completing the classic double-extortion model. This rule is distinguished from single-capability data-write findings by the confirmed read-before-write pattern, which signals a deliberate data-hostage scenario rather than an accidental or isolated destructive permission."
+    }
+  ]
+}

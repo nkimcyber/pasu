@@ -1,0 +1,242 @@
+{
+  "_description": "Golden corpus of IAM policy fixtures for regression testing the review/classification/detection flow. Each entry documents the scenario being tested, the actions in the fixture, and the key expected outputs that regression tests assert against.",
+  "_schema_note": "evidence_layers: 'catalog' = static HIGH/MEDIUM_RISK_ACTIONS sets; 'classification' = reviewed action_classification.yaml records; 'composite' = multi-capability pattern rules in composite_detections.yaml",
+
+  "priv_escalation_ec2": {
+    "fixture": "fixtures/priv_escalation_ec2.json",
+    "scenario": "Privilege escalation via EC2 compute — complete chain: role delegation + compute launch",
+    "actions": ["iam:PassRole", "ec2:RunInstances"],
+    "evidence_layers": {
+      "catalog": {
+        "high_risk_actions": ["iam:passrole", "ec2:runinstances"],
+        "medium_risk_actions": []
+      },
+      "classification": {
+        "iam:PassRole": {"status": "classified", "confidence": "high", "capabilities": ["privilege-delegation"]},
+        "ec2:RunInstances": {"status": "classified", "confidence": "high", "capabilities": ["compute-with-role"]}
+      },
+      "composite": {
+        "expected_rules": ["COMP-001"],
+        "COMP-001": {"title": "Privilege Escalation via EC2 Compute", "confidence": "high", "severity": "critical"}
+      }
+    },
+    "expected_rule_findings": {
+      "R003_count": 2,
+      "R003_actions": ["ec2:runinstances", "iam:passrole"],
+      "R004_count": 0
+    },
+    "expected_fix": {
+      "auto_removals": ["iam:passrole", "ec2:runinstances"],
+      "gate_blocked": [],
+      "note": "Both actions are classified/high — fix gate passes for both; all actions removed so placeholder is inserted."
+    }
+  },
+
+  "priv_escalation_lambda": {
+    "fixture": "fixtures/priv_escalation_lambda.json",
+    "scenario": "Privilege escalation via Lambda serverless — role delegation + function creation",
+    "actions": ["iam:PassRole", "lambda:CreateFunction"],
+    "evidence_layers": {
+      "catalog": {
+        "high_risk_actions": ["iam:passrole", "lambda:createfunction"],
+        "medium_risk_actions": []
+      },
+      "classification": {
+        "iam:PassRole": {"status": "classified", "confidence": "high", "capabilities": ["privilege-delegation"]},
+        "lambda:CreateFunction": {"status": "classified", "confidence": "high", "capabilities": ["serverless-with-role"]}
+      },
+      "composite": {
+        "expected_rules": ["COMP-002"],
+        "COMP-002": {"title": "Privilege Escalation via Serverless Function", "confidence": "high", "severity": "critical"}
+      }
+    },
+    "expected_rule_findings": {
+      "R003_count": 2,
+      "R003_actions": ["iam:passrole", "lambda:createfunction"],
+      "R004_count": 0
+    },
+    "expected_fix": {
+      "auto_removals": ["iam:passrole", "lambda:createfunction"],
+      "gate_blocked": [],
+      "note": "Both actions are classified/high — gate passes; placeholder inserted."
+    }
+  },
+
+  "policy_modification": {
+    "fixture": "fixtures/policy_modification.json",
+    "scenario": "Direct IAM policy takeover — policy-modification capability alone is sufficient for COMP-003",
+    "actions": ["iam:AttachRolePolicy", "iam:CreatePolicyVersion"],
+    "evidence_layers": {
+      "catalog": {
+        "high_risk_actions": ["iam:attachrolepolicy", "iam:createpolicyversion"],
+        "medium_risk_actions": []
+      },
+      "classification": {
+        "iam:AttachRolePolicy": {"status": "classified", "confidence": "high", "capabilities": ["policy-modification"]},
+        "iam:CreatePolicyVersion": {"status": "classified", "confidence": "high", "capabilities": ["policy-modification"]}
+      },
+      "composite": {
+        "expected_rules": ["COMP-003"],
+        "COMP-003": {"title": "Direct IAM Policy Takeover", "confidence": "high", "severity": "critical"}
+      }
+    },
+    "expected_rule_findings": {
+      "R003_count": 2,
+      "R003_actions": ["iam:attachrolepolicy", "iam:createpolicyversion"],
+      "R004_count": 0
+    },
+    "expected_fix": {
+      "auto_removals": ["iam:attachrolepolicy", "iam:createpolicyversion"],
+      "gate_blocked": [],
+      "note": "Both classified/high — gate passes."
+    }
+  },
+
+  "credential_and_secret_read": {
+    "fixture": "fixtures/credential_and_secret_read.json",
+    "scenario": "Credential exfiltration — composite COMP-004 fires but neither action is in HIGH_RISK_ACTIONS, so fix does not auto-remove. Composite detection adds value beyond individual findings.",
+    "actions": ["iam:CreateAccessKey", "secretsmanager:GetSecretValue"],
+    "evidence_layers": {
+      "catalog": {
+        "high_risk_actions": [],
+        "medium_risk_actions": ["iam:createaccesskey", "secretsmanager:getsecretvalue"]
+      },
+      "classification": {
+        "iam:CreateAccessKey": {"status": "classified", "confidence": "high", "capabilities": ["credential-issuance"]},
+        "secretsmanager:GetSecretValue": {"status": "classified", "confidence": "high", "capabilities": ["secret-read"]}
+      },
+      "composite": {
+        "expected_rules": ["COMP-004"],
+        "COMP-004": {"title": "Persistent Credential Exfiltration", "confidence": "high", "severity": "high"}
+      }
+    },
+    "expected_rule_findings": {
+      "R003_count": 0,
+      "R004_count": 2,
+      "R004_actions": ["iam:createaccesskey", "secretsmanager:getsecretvalue"]
+    },
+    "expected_fix": {
+      "auto_removals": [],
+      "gate_blocked": [],
+      "note": "Neither action is in HIGH_RISK_ACTIONS — fix has nothing to remove. Actions remain in output policy. Manual review is the only recourse."
+    }
+  },
+
+  "unknown_action_only": {
+    "fixture": "fixtures/unknown_action_only.json",
+    "scenario": "Unknown action not present in any evidence layer — proves system does not over-classify unreviewed actions",
+    "actions": ["svc:UnreviewedAction"],
+    "evidence_layers": {
+      "catalog": {
+        "high_risk_actions": [],
+        "medium_risk_actions": []
+      },
+      "classification": {},
+      "composite": {
+        "expected_rules": [],
+        "note": "No classified capabilities — no composite rule can fire."
+      }
+    },
+    "expected_rule_findings": {
+      "R003_count": 0,
+      "R004_count": 0
+    },
+    "expected_fix": {
+      "auto_removals": [],
+      "gate_blocked": [],
+      "note": "Not in HIGH_RISK_ACTIONS — fix gate never evaluates it. Action is left untouched with no manual_review note."
+    }
+  },
+
+  "data_read_no_composite": {
+    "fixture": "fixtures/data_read_no_composite.json",
+    "scenario": "Data-read-only capabilities — COMP-009 and COMP-010 require additional capabilities not present, so no composite rule fires",
+    "actions": ["rds:CopyDBSnapshot", "dynamodb:Scan"],
+    "evidence_layers": {
+      "catalog": {
+        "high_risk_actions": [],
+        "medium_risk_actions": ["rds:copydbsnapshot"]
+      },
+      "classification": {
+        "rds:CopyDBSnapshot": {"status": "classified", "confidence": "medium", "capabilities": ["data-read-sensitive"]},
+        "dynamodb:Scan": {"status": "classified", "confidence": "medium", "capabilities": ["data-read-sensitive"]}
+      },
+      "composite": {
+        "expected_rules": [],
+        "note": "Only data-read-sensitive is present. COMP-009 needs secret-read also. COMP-010 needs data-write-sensitive also. No rule fires."
+      }
+    },
+    "expected_rule_findings": {
+      "R003_count": 0,
+      "R004_count_min": 1,
+      "note": "rds:CopyDBSnapshot is in MEDIUM_RISK_ACTIONS (R004). dynamodb:Scan may produce a context-dependent R004 on unrestricted Resource."
+    },
+    "expected_fix": {
+      "auto_removals": [],
+      "gate_blocked": [],
+      "note": "Neither action is in HIGH_RISK_ACTIONS — fix retains both."
+    }
+  },
+
+  "mixed_classified_and_unknown": {
+    "fixture": "fixtures/mixed_classified_and_unknown.json",
+    "scenario": "Mixed policy: one classified/high action and one unknown action. Fix removes the classified action; unknown is left untouched.",
+    "actions": ["iam:PassRole", "svc:FutureAction"],
+    "evidence_layers": {
+      "catalog": {
+        "high_risk_actions": ["iam:passrole"],
+        "medium_risk_actions": []
+      },
+      "classification": {
+        "iam:PassRole": {"status": "classified", "confidence": "high", "capabilities": ["privilege-delegation"]},
+        "svc:FutureAction": "not present"
+      },
+      "composite": {
+        "expected_rules": [],
+        "note": "Only privilege-delegation is confirmed. No composite rule requires privilege-delegation alone."
+      }
+    },
+    "expected_rule_findings": {
+      "R003_count": 1,
+      "R003_actions": ["iam:passrole"],
+      "R004_count": 0
+    },
+    "expected_fix": {
+      "auto_removals": ["iam:passrole"],
+      "remaining_actions": ["svc:FutureAction"],
+      "gate_blocked": [],
+      "note": "iam:PassRole is classified/high — removed. svc:FutureAction is not in HIGH_RISK_ACTIONS — left alone with no gate note."
+    }
+  },
+
+  "not_applicable_gate": {
+    "fixture": "fixtures/not_applicable_gate.json",
+    "scenario": "Action in HIGH_RISK_ACTIONS but classified as not-applicable — R003 fires (catalog match) but fix gate blocks removal (reviewed classification overrides).",
+    "actions": ["kms:DescribeKey"],
+    "evidence_layers": {
+      "catalog": {
+        "high_risk_actions": ["kms:describekey"],
+        "medium_risk_actions": []
+      },
+      "classification": {
+        "kms:DescribeKey": {"status": "not-applicable", "confidence": "high", "capabilities": []}
+      },
+      "composite": {
+        "expected_rules": [],
+        "note": "not-applicable classification means is_confirmed_risky=False — no capabilities contribute to composite matching."
+      }
+    },
+    "expected_rule_findings": {
+      "R003_count": 1,
+      "R003_actions": ["kms:describekey"],
+      "R004_count": 0,
+      "note": "R003 fires because kms:DescribeKey is in the static HIGH_RISK_ACTIONS set. Classification status is not checked by the rule engine."
+    },
+    "expected_fix": {
+      "auto_removals": [],
+      "gate_blocked": ["kms:DescribeKey"],
+      "manual_review_contains": ["not-applicable"],
+      "note": "Fix gate checks classification and finds not-applicable — removal withheld. Action remains in output policy. Manual review note explains reason."
+    }
+  }
+}
