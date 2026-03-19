@@ -215,4 +215,5 @@ prompts/
 scripts/debug_agent
 docs/workflow.md
 reports/
+Claude.md
 .claude

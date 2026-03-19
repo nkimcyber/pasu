@@ -48,6 +48,17 @@ class ExplainResult(BaseModel):
         ..., description="Bullet point list of what each statement does."
     )
     status: str = Field(default="ok")
+    ai_generated: bool = Field(
+        default=False,
+        description="True when summary and details were produced by an AI model.",
+    )
+    ai_disclaimer: str = Field(
+        default="",
+        description=(
+            "Present when ai_generated is True. Reminds consumers that narrative "
+            "fields are model-generated and have not been independently verified."
+        ),
+    )
 
 
 class RuleFinding(BaseModel):
@@ -97,6 +108,17 @@ class EscalationResult(BaseModel):
     summary: str = Field(..., description="One-sentence overall risk summary.")
     risk_score: int = Field(default=0, description="Numeric risk score 0-100.")
     status: str = Field(default="ok")
+    ai_generated: bool = Field(
+        default=False,
+        description="True when summary and findings were produced by an AI model.",
+    )
+    ai_disclaimer: str = Field(
+        default="",
+        description=(
+            "Present when ai_generated is True. Reminds consumers that narrative "
+            "fields are model-generated and have not been independently verified."
+        ),
+    )
 
 
 class FixChange(BaseModel):
