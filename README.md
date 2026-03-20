@@ -6,7 +6,7 @@ Pasu is a local-first CLI that helps you review IAM policies without standing up
 
 ## Why use Pasu?
 
-- **Catch privilege escalation fast** — detect risky actions and overly permissive IAM patterns before they ship. Pasu’s local mode currently includes 30 detection rules: 19 high-risk, 6 medium-risk, and 5 structural rules.
+- **Catch privilege escalation fast** — detect risky actions and overly permissive IAM patterns before they ship. Pasu's local mode currently includes 30 detection rules: 19 high-risk, 6 medium-risk, and 5 structural rules.
 - **Explain IAM in plain English** — turn raw policy JSON into output that is easier to review and easier to share with non-IAM specialists. `pasu explain` is built for this exact use case.
 - **Generate a safer proposal** — `pasu fix` produces a safer proposed policy, keeps risky unknowns visible, and tells you what still needs manual review instead of pretending to fully auto-remediate.
 - **Use it locally or in CI** — Pasu supports `--format json` and `--format sarif`, and the project already includes a GitHub Actions workflow example for Code Scanning integration.
@@ -64,7 +64,7 @@ Why this matters:
 
 - `iam:PassRole` is a core privilege-delegation primitive.
 - `ec2:RunInstances` can launch compute with an attached IAM role.
-- Together, that combination maps to Pasu’s reviewed composite detection for **Privilege Escalation via EC2 Compute**.
+- Together, that combination maps to Pasu's reviewed composite detection for **Privilege Escalation via EC2 Compute**.
 
 ---
 
@@ -76,7 +76,7 @@ Why this matters:
 pasu scan --file policy.json
 ```
 
-Runs both explain and escalate together. This is the fastest way to understand what a policy allows and whether it introduces risky access. `scan` is one of Pasu’s primary CLI commands.
+Runs both explain and escalate together. This is the fastest way to understand what a policy allows and whether it introduces risky access. `scan` is one of Pasu's primary CLI commands.
 
 ### Explain what a policy does
 
@@ -108,22 +108,34 @@ Save the result to a file:
 pasu fix --file policy.json --output fixed_policy.json
 ```
 
-### Get AI-powered analysis
+#### Fix modes
 
+**Local mode (default):**
+```bash
+pasu fix --file policy.json
+```
+Uses SAFE_ALTERNATIVES mapping to replace dangerous actions with safe read-only alternatives when available. Fast (no API calls), works offline.
+
+**AI mode:**
+Linux / Mac:
 ```bash
 export ANTHROPIC_API_KEY="sk-..."
-pasu scan --file policy.json --ai
+pasu fix --file policy.json --ai
 ```
 
-The `--ai` flag enables Claude-powered natural-language explanations and deeper remediation guidance. Pasu still performs local analysis first; AI is optional.
+Windows (PowerShell):
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-..."
+pasu fix --file policy.json --ai
+```
+Claude infers the policy's intent and generates a context-aware least-privilege policy with automatic Condition blocks and ARN scoping. Takes 2-3 seconds per call.
 
----
 
 ## What Pasu detects
 
 ### High-risk patterns
 
-Pasu’s local analyzer looks for high-risk permissions and structures such as:
+Pasu's local analyzer looks for high-risk permissions and structures such as:
 
 - wildcard actions like `"Action": "*"`
 - wildcard resources like `"Resource": "*"`
@@ -159,7 +171,7 @@ The local analyzer also flags policy structures that are risky even when the ind
 
 Pasu is optimized for a different workflow:
 
-- **Local-first** — useful before deployment, during code review, or while iterating on policy JSON. Pasu’s product direction explicitly prioritizes local-first usage.
+- **Local-first** — useful before deployment, during code review, or while iterating on policy JSON. Pasu's product direction explicitly prioritizes local-first usage.
 - **Fast human-readable explanation** — useful when the main problem is understanding what a policy actually allows.
 - **Conservative remediation** — Pasu prefers a reviewable proposed policy plus manual-review notes over overconfident auto-remediation.
 - **Automation-friendly output** — JSON and SARIF are first-class outputs for pipelines and code scanning.
@@ -207,7 +219,7 @@ Pasu uses a two-step model:
 
 ### Packaged rule and data files
 
-Pasu’s local analyzer loads rule and scoring data from package-managed files rather than hardcoding everything in one module. Current packaged files include:
+Pasu's local analyzer loads rule and scoring data from package-managed files rather than hardcoding everything in one module. Current packaged files include:
 
 - `app/rules/risky_actions.yaml`
 - `app/rules/scoring.yaml`
@@ -232,15 +244,15 @@ Pasu currently ships with:
 - `pasu explain`
 - `pasu escalate`
 - `pasu scan`
-- `pasu fix`
+- `pasu fix` (local and AI modes)
 - local mode with no API key required
-- optional AI mode with Claude
+- optional AI mode with Claude (for `scan` and `fix`)
 - JSON and SARIF output
 - GitHub Actions CI/CD
 - PyPI distribution
 - packaged rule/scoring/fix data
 - canonical AWS action catalog snapshot and local sync/diff tooling
-- 159 pytest tests passing
+- 159+ pytest tests passing
 
 ---
 
@@ -253,6 +265,7 @@ Completed:
 - [x] more detection rules
 - [x] JSON and SARIF output
 - [x] `pasu fix` safer proposed policy generation
+- [x] `pasu fix --ai` context-aware least-privilege generation with SAFE_ALTERNATIVES
 - [x] externalized rule/scoring/fix data
 - [x] AWS catalog sync foundation
 - [x] GitHub Actions scheduled AWS catalog sync + diff workflow
@@ -268,9 +281,9 @@ For the broader product direction, see `docs/PRODUCT_SPEC.md`.
 
 ---
 
-## Why “Pasu”?
+## Why "Pasu"?
 
-Pasu (파수/把守) means **guard** or **sentinel** — as in guarding the gate. The name fits the project’s goal: helping you keep dangerous permissions out of your cloud IAM layer.
+Pasu (파수/把守) means **guard** or **sentinel** — as in guarding the gate. The name fits the project's goal: helping you keep dangerous permissions out of your cloud IAM layer.
 
 ---
 
