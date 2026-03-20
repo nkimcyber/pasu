@@ -553,13 +553,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
         return
 
     try:
-        if args.ai:
-            _require_api_key(use_machine)
-            explain_result = explain_policy(policy_json=policy_json)
-            escalate_result = escalate_policy(policy_json=policy_json)
-        else:
-            explain_result = explain_policy_local(policy_json=policy_json)
-            escalate_result = escalate_policy_local(policy_json=policy_json)
+        explain_result = explain_policy_local(policy_json=policy_json)
+        escalate_result = escalate_policy_local(policy_json=policy_json)
 
         escalate_result.risk_level = risk_score_label(escalate_result.risk_score)
         
@@ -612,27 +607,43 @@ def _print_fix(result, output_path: str | None, original_score: int, fixed_score
 
     if result.changes:
         print(_section("Changes Applied"))
+
+        # Group changes by statement index so the user sees one block per statement.
+        from collections import defaultdict
+        by_stmt: dict[int, list] = defaultdict(list)
+        for change in result.changes:
+            by_stmt[change.statement_index].append(change)
+
         resource_wildcard_statement_indexes: list[int] = []
         resource_wildcard_reason: str | None = None
 
-        for change in result.changes:
-            if change.type == "removed_action":
-                print(f"  • Removed {_color(change.action or '', _RED)}: {change.reason}")
-            elif change.type in ("scoped_wildcard", "replaced_wildcard"):
-                from_str = _color(change.from_ or "", _YELLOW)
-                to_str = _color(", ".join(change.to or []), _GREEN)
-                print(f"  • {from_str}  →  {to_str}")
-                print(f"      {change.reason}")
-            elif change.type == "resource_wildcard_warning":
-                resource_wildcard_statement_indexes.append(change.statement_index)
-                if resource_wildcard_reason is None:
-                    resource_wildcard_reason = change.reason or ""
+        stmts = result.fixed_policy.get("Statement", [])
+        for stmt_idx in sorted(by_stmt):
+            # Build a label: "Statement N (SID)" or just "Statement N"
+            sid: str | None = None
+            if 0 <= stmt_idx < len(stmts):
+                sid = stmts[stmt_idx].get("Sid")
+            stmt_label = f"Statement {stmt_idx + 1}" + (f" ({sid})" if sid else "")
+            print(f"\n  {_color(stmt_label, _BOLD)}")
+
+            for change in by_stmt[stmt_idx]:
+                if change.type == "removed_action":
+                    print(f"    • Removed {_color(change.action or '', _RED)}: {change.reason}")
+                elif change.type in ("scoped_wildcard", "replaced_wildcard"):
+                    from_str = _color(change.from_ or "", _YELLOW)
+                    to_str = _color(", ".join(change.to or []), _GREEN)
+                    print(f"    • {from_str}  →  {to_str}")
+                    print(f"        {change.reason}")
+                elif change.type == "resource_wildcard_warning":
+                    resource_wildcard_statement_indexes.append(change.statement_index)
+                    if resource_wildcard_reason is None:
+                        resource_wildcard_reason = change.reason or ""
 
         if resource_wildcard_statement_indexes and resource_wildcard_reason is not None:
             one_based = sorted(set(i + 1 for i in resource_wildcard_statement_indexes))
             stmt_str = ", ".join(str(i) for i in one_based)
             print(
-                f"  • {_color('WARNING', _YELLOW)}: "
+                f"\n  • {_color('WARNING', _YELLOW)}: "
                 f"{resource_wildcard_reason} (Statements: {stmt_str})"
             )
 
@@ -672,7 +683,18 @@ def _print_fix(result, output_path: str | None, original_score: int, fixed_score
         print(f"  Fixed policy written to: {output_path}")
 
 def cmd_fix(args: argparse.Namespace) -> None:
+    """Fix IAM policies by removing dangerous permissions.
+
+    Modes:
+    - Local mode (default): Uses hardcoded SAFE_ALTERNATIVES mapping
+    - AI mode (--ai): Uses Claude to infer policy intent and generate least-privilege policy
+    """
+    use_ai = getattr(args, "ai", False)
     use_machine = args.format != "text"
+
+    if use_ai:
+        _require_api_key(use_machine)
+
     try:
         policy_json = _load_policy(args.file)
     except (FileNotFoundError, ValueError) as exc:
@@ -681,6 +703,7 @@ def cmd_fix(args: argparse.Namespace) -> None:
 
     try:
         result = fix_policy_local(policy_json=policy_json)
+        # AI mode: fix_policy_ai() will be wired here in a follow-up task.
     except ValueError as exc:
         _handle_error(f"Validation error: {exc}", use_machine)
         return
@@ -767,7 +790,6 @@ def main() -> None:
     )
     p_scan.add_argument("--file", required=True, metavar="FILE",
                         help="Path to the IAM policy JSON file.")
-    p_scan.add_argument("--ai", **_ai_kwargs)
     p_scan.add_argument("--format", **_format_kwargs)
     p_scan.set_defaults(func=cmd_scan)
 
@@ -778,6 +800,7 @@ def main() -> None:
     )
     p_fix.add_argument("--file", required=True, metavar="FILE",
                        help="Path to the IAM policy JSON file.")
+    p_fix.add_argument("--ai", **_ai_kwargs)
     p_fix.add_argument(
         "--format",
         choices=["text", "json"],

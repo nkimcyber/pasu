@@ -12,6 +12,7 @@ import anthropic
 
 from app import aws_client
 from app.action_classification import load_action_classification
+from app.fix import SAFE_ALTERNATIVES
 from app.models import (
     AnalysisResult,
     EscalationFinding,
@@ -1436,6 +1437,7 @@ def fix_policy_local(policy_json: str) -> FixResult:
             ))
         else:
             seen: set[str] = set()
+            removed_actions: list[str] = []
             for action in raw_actions:
                 al = action.lower()
                 if al.endswith(":*"):
@@ -1486,6 +1488,7 @@ def fix_policy_local(policy_json: str) -> FixResult:
                             fixed_actions.append(action)
                     else:
                         # Gate passed (classified + medium/high confidence) → remove.
+                        removed_actions.append(action)
                         changes.append(FixChange(
                             type="removed_action",
                             statement_index=i,
@@ -1501,14 +1504,49 @@ def fix_policy_local(policy_json: str) -> FixResult:
                         seen.add(action)
                         fixed_actions.append(action)
 
-            # All actions were removed → placeholder
+            # All actions were removed → try safe alternatives, fall back to TODO
             if not fixed_actions:
-                fixed_actions = ["TODO:specify-needed-actions"]
-                manual_review_needed.append(
-                    f"{statement_label} had all actions removed. "
-                    "Manual review required. "
-                    'Replace "TODO:specify-needed-actions" with the minimum safe actions this policy needs.'
-                )
+                safe_alts: list[str] = []
+                guidance_msgs: list[str] = []
+                for action in removed_actions:
+                    # SAFE_ALTERNATIVES keys are PascalCase; match case-insensitively
+                    matched_key = next(
+                        (k for k in SAFE_ALTERNATIVES if k.lower() == action.lower()),
+                        None,
+                    )
+                    if matched_key is not None:
+                        alts, reason = SAFE_ALTERNATIVES[matched_key]
+                        if alts:
+                            safe_alts.extend(alts)
+                        else:
+                            guidance_msgs.append(f"'{action}': {reason}")
+
+                if safe_alts:
+                    deduped_alts = list(dict.fromkeys(safe_alts))
+                    fixed_actions = deduped_alts
+                    changes.append(FixChange(
+                        type="replaced_wildcard",
+                        statement_index=i,
+                        from_=", ".join(removed_actions),
+                        to=deduped_alts,
+                        reason=(
+                            f"Removed dangerous action(s); replaced with "
+                            f"read-only alternatives"
+                        ),
+                    ))
+                else:
+                    fixed_actions = ["TODO:specify-needed-actions"]
+                    guidance = (
+                        "; ".join(guidance_msgs)
+                        if guidance_msgs
+                        else "specify the minimum safe actions this policy needs"
+                    )
+                    manual_review_needed.append(
+                        f"{statement_label} had all actions removed. "
+                        f"Manual review required. "
+                        f'Replace "TODO:specify-needed-actions" with the minimum safe actions this policy needs. '
+                        f"{guidance}"
+                    )
 
         fixed_stmt["Action"] = fixed_actions
 
