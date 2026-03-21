@@ -1249,7 +1249,8 @@ class TestCliJsonOutput:
 
     def test_scan_json_has_nested_explain_and_escalate(self, tmp_path):
         from app.cli import cmd_scan
-        args = _make_args(tmp_path, "scan", _SIMPLE_POLICY)
+        # Use a high-risk policy so it passes the Critical/High detail threshold.
+        args = _make_args(tmp_path, "scan", _RISKY_POLICY)
         with _capture_stdout() as buf:
             cmd_scan(args)
         data = json.loads(buf.getvalue())

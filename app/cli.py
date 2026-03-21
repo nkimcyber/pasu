@@ -39,6 +39,78 @@ def _reconfigure_streams() -> None:
     if hasattr(sys.stderr, "buffer"):
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+
+# ── CLI argument validators ────────────────────────────────────────────────────
+
+_RE_CLI_ROLE_ARN = re.compile(r"^arn:aws:iam::\d{12}:role/[\w+=,.@/-]+$")
+_RE_CLI_PROFILE = re.compile(r"^[\w@.-]{1,64}$")
+_RE_CLI_IAM_NAME = re.compile(r"^[\w+=,.@/-]{1,128}$")
+
+
+def _validate_cli_role_arn(value: str) -> str:
+    """Validate and return an IAM role ARN CLI argument.
+
+    Args:
+        value: The raw ``--assume-role`` argument string.
+
+    Returns:
+        The validated ARN string unchanged.
+
+    Raises:
+        argparse.ArgumentTypeError: If *value* does not match the IAM role
+            ARN pattern ``arn:aws:iam::<12digits>:role/<name>``.
+    """
+    if not _RE_CLI_ROLE_ARN.match(value):
+        raise argparse.ArgumentTypeError(
+            f"Invalid role ARN '{value}'. "
+            "Expected format: arn:aws:iam::<account-id>:role/<role-name>"
+        )
+    return value
+
+
+def _validate_cli_profile(value: str) -> str:
+    """Validate and return an AWS profile name CLI argument.
+
+    Args:
+        value: The raw ``--profile`` argument string.
+
+    Returns:
+        The validated profile name unchanged.
+
+    Raises:
+        argparse.ArgumentTypeError: If *value* contains unsafe characters or
+            exceeds 64 characters.
+    """
+    if not _RE_CLI_PROFILE.match(value):
+        raise argparse.ArgumentTypeError(
+            f"Invalid profile name '{value}'. "
+            "Use only alphanumeric characters, hyphens, underscores, "
+            "dots, or '@' (max 64 characters)."
+        )
+    return value
+
+
+def _validate_cli_iam_name(value: str) -> str:
+    """Validate and return an IAM role or user name CLI argument.
+
+    Args:
+        value: The raw ``--role`` or ``--user`` argument string.
+
+    Returns:
+        The validated name unchanged.
+
+    Raises:
+        argparse.ArgumentTypeError: If *value* violates IAM name constraints
+            (``[\\w+=,.@-]``, max 128 characters).
+    """
+    if not _RE_CLI_IAM_NAME.match(value):
+        raise argparse.ArgumentTypeError(
+            f"Invalid IAM name '{value}'. "
+            "Use only alphanumeric characters and +=,.@- (max 128 characters)."
+        )
+    return value
+
+
 # ── ANSI color helpers ────────────────────────────────────────────────────────
 
 _RESET  = "\033[0m"
@@ -52,7 +124,8 @@ _WHITE  = "\033[97m"
 
 def _supports_color() -> bool:
     """Return True if the terminal supports ANSI color codes."""
-    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    stream = getattr(sys, "_real_stdout", sys.stdout)
+    return hasattr(stream, "isatty") and stream.isatty()
 
 
 def _color(text: str, code: str) -> str:
@@ -177,12 +250,18 @@ def _print_banner() -> None:
 def _load_policy(path: str) -> str:
     """Load and validate policy JSON from disk.
 
+    The path is canonicalized via ``os.path.realpath`` before opening to
+    eliminate ``..`` traversal sequences.  In a future server-context use
+    an additional allowlist directory check would be required here.
+
     Raises:
         FileNotFoundError: If the file does not exist.
         ValueError: If the file is not valid JSON.
     """
+    # Canonicalize to resolve symlinks and remove any .. traversal components.
+    canonical_path = os.path.realpath(path)
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(canonical_path, encoding="utf-8") as fh:
             content = fh.read()
         json.loads(content)
         return content
@@ -382,6 +461,50 @@ def _escalate_to_json(result, rule_findings) -> dict:
     }
 
 
+def _compute_finding_counts(
+    rule_findings: list,
+    escalate_result,
+) -> dict[str, int]:
+    """Aggregate severity counts from rule findings and composite findings.
+
+    Args:
+        rule_findings: List of RuleFinding objects from analyze_policy_rules().
+        escalate_result: EscalationResult; composite_findings dicts are read from it.
+
+    Returns:
+        Dict with keys ``critical``, ``high``, ``medium``, ``low`` as integer counts.
+    """
+    counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for f in rule_findings:
+        sev = getattr(f, "severity", "").lower()
+        if sev in counts:
+            counts[sev] += 1
+    composite: list[dict] = getattr(escalate_result, "composite_findings", [])
+    for f in composite:
+        sev = f.get("severity", "").lower()
+        if sev in counts:
+            counts[sev] += 1
+    return counts
+
+
+def _print_scan_summary(n_resources: int, counts: dict[str, int]) -> None:
+    """Print the scan summary line to stdout.
+
+    Always printed regardless of --quiet or --all flags.
+
+    Args:
+        n_resources: Number of IAM resources (policies) scanned.
+        counts: Severity counts dict with keys critical, high, medium, low.
+    """
+    print(
+        f"Scanned {n_resources} resource{'s' if n_resources != 1 else ''} \u2014 "
+        f"Critical: {counts['critical']}, "
+        f"High: {counts['high']}, "
+        f"Medium: {counts['medium']}, "
+        f"Low: {counts['low']}"
+    )
+
+
 def _scan_to_json(explain_result, escalate_result, rule_findings) -> dict:
     return {
         "explain": _explain_to_json(explain_result),
@@ -545,13 +668,27 @@ def cmd_escalate(args: argparse.Namespace) -> None:
         _print_escalate(result, policy_json=policy_json)
 
 
+def _is_critical_or_high(counts: dict[str, int]) -> bool:
+    """Return True if the counts dict has any Critical or High findings.
+
+    Args:
+        counts: Severity count dict with keys ``critical``, ``high``,
+            ``medium``, ``low``.
+
+    Returns:
+        True when at least one Critical or High finding is present.
+    """
+    return counts.get("critical", 0) > 0 or counts.get("high", 0) > 0
+
+
 def _run_scan_on_policy(
     policy_json: str,
     policy_label: str,
     use_machine: bool,
     output_format: str,
     policy_arn: str = "",
-) -> dict | None:
+    show_all: bool = False,
+) -> tuple[dict | None, dict[str, int] | None]:
     """Run the full scan pipeline on a single policy JSON string.
 
     Args:
@@ -563,52 +700,210 @@ def _run_scan_on_policy(
         policy_arn: Constructed ARN for the policy resource. Empty string when
             scanning from a local file (no account context) or when STS lookup
             failed during profile-mode collection.
+        show_all: When True, show full detail for all severities. When False
+            (default), full detail is shown only for Critical and High findings.
 
     Returns:
-        Scan result dict when output_format is 'json', else None.
+        A 2-tuple of ``(json_result, counts)`` where ``json_result`` is the scan
+        result dict when ``output_format`` is ``'json'`` (else ``None``) and
+        ``counts`` is the severity count dict (or ``None`` on error).
     """
     try:
         explain_result = explain_policy_local(policy_json=policy_json)
         escalate_result = escalate_policy_local(policy_json=policy_json)
         escalate_result.risk_level = risk_score_label(escalate_result.risk_score)
-        need_findings = output_format in ("json", "sarif")
-        rule_findings = analyze_policy_rules(policy_json) if need_findings else []
+        rule_findings = analyze_policy_rules(policy_json)
     except ValueError as exc:
         _handle_error(f"Validation error: {exc}", use_machine)
-        return None
+        return None, None
     except RuntimeError as exc:
         _handle_error(str(exc), use_machine)
-        return None
+        return None, None
+
+    counts = _compute_finding_counts(rule_findings, escalate_result)
+    show_detail = show_all or _is_critical_or_high(counts)
 
     if output_format == "json":
         result = _scan_to_json(explain_result, escalate_result, rule_findings)
         result["policy_label"] = policy_label
         if policy_arn:
             result["policy_arn"] = policy_arn
-        return result
+        # Signal to the caller whether this policy meets the detail threshold.
+        result["_show_detail"] = show_detail
+        return result, counts
     if output_format == "sarif":
         print(json.dumps(_build_sarif(policy_label, rule_findings, escalate_result), indent=2))
-        return None
-    # text
-    print(_color(f"\n{'=' * 60}", _CYAN))
-    print(_color(f"  Policy: {policy_label}", _BOLD))
-    if policy_arn:
-        print(_color(f"  Policy ARN: {policy_arn}", _BOLD))
-    print(_color(f"{'=' * 60}", _CYAN))
-    _print_scan(explain_result, escalate_result, policy_json=policy_json)
-    return None
+        return None, counts
+    # text — only emit detail block when the severity threshold is met
+    if show_detail:
+        print(_color(f"\n{'=' * 60}", _CYAN))
+        print(_color(f"  Policy: {policy_label}", _BOLD))
+        if policy_arn:
+            print(_color(f"  Policy ARN: {policy_arn}", _BOLD))
+        print(_color(f"{'=' * 60}", _CYAN))
+        _print_scan(explain_result, escalate_result, policy_json=policy_json)
+    return None, counts
+
+
+def _merge_counts(
+    total: dict[str, int], addition: dict[str, int]
+) -> dict[str, int]:
+    """Return a new dict that is the element-wise sum of two severity count dicts.
+
+    Args:
+        total: Accumulator dict with keys critical, high, medium, low.
+        addition: Counts to add.
+
+    Returns:
+        New dict with summed counts.
+    """
+    return {k: total[k] + addition.get(k, 0) for k in total}
+
+
+def _run_profile_scan(
+    policies: list,  # list[CollectedPolicy] — typed as plain list to avoid circular import
+    args: argparse.Namespace,
+    use_machine: bool,
+    show_all: bool,
+    zero: dict[str, int],
+) -> None:
+    """Render scan output for a list of collected policies in profile mode.
+
+    Shared by both the full-account scan path and the targeted (--role /
+    --user) path so that output formatting is consistent.
+
+    Args:
+        policies: List of ``CollectedPolicy`` objects to scan.
+        args: Parsed CLI arguments (used for ``args.format``).
+        use_machine: True when output format is json or sarif.
+        show_all: When True, show full detail for all severities.
+        zero: Empty severity-count dict used as the accumulator base.
+    """
+    if args.format == "json":
+        all_results: list[dict] = []
+        total_counts = dict(zero)
+        for policy in policies:
+            json_result, counts = _run_scan_on_policy(
+                policy.policy_json,
+                policy.name,
+                use_machine,
+                args.format,
+                policy_arn=policy.policy_arn,
+                show_all=show_all,
+            )
+            if json_result is not None:
+                all_results.append(json_result)
+            if counts is not None:
+                total_counts = _merge_counts(total_counts, counts)
+        filtered_results = [
+            {k: v for k, v in r.items() if k != "_show_detail"}
+            for r in all_results
+            if r.get("_show_detail", True)
+        ]
+        summary_obj = {
+            "resources": len(all_results),
+            "critical": total_counts["critical"],
+            "high": total_counts["high"],
+            "medium": total_counts["medium"],
+            "low": total_counts["low"],
+        }
+        print(
+            json.dumps(
+                {
+                    "summary": summary_obj,
+                    "policies": filtered_results,
+                    "status": "success",
+                },
+                indent=2,
+            )
+        )
+    elif args.format == "text":
+        import io as _io
+
+        policy_outputs: list[str] = []
+        total_counts = dict(zero)
+        for policy in policies:
+            buf = _io.StringIO()
+            old_stdout = sys.stdout
+            sys._real_stdout = sys.stdout
+            sys.stdout = buf
+            try:
+                _, counts = _run_scan_on_policy(
+                    policy.policy_json,
+                    policy.name,
+                    use_machine,
+                    args.format,
+                    policy_arn=policy.policy_arn,
+                    show_all=show_all,
+                )
+            finally:
+                sys.stdout = old_stdout
+                del sys._real_stdout
+            policy_outputs.append(buf.getvalue())
+            if counts is not None:
+                total_counts = _merge_counts(total_counts, counts)
+        _print_scan_summary(len(policies), total_counts)
+        for block in policy_outputs:
+            sys.stdout.write(block)
+    else:
+        for policy in policies:
+            _run_scan_on_policy(
+                policy.policy_json,
+                policy.name,
+                use_machine,
+                args.format,
+                policy_arn=policy.policy_arn,
+                show_all=show_all,
+            )
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
     """Handle the 'scan' command in both file and profile modes.
 
-    File mode:  pasu scan --file policy.json [--format FORMAT]
-    Profile mode: pasu scan --profile PROFILE [--role ROLE_ARN] [--format FORMAT]
+    File mode:
+        pasu scan --file policy.json [--format FORMAT] [--all]
+
+    Profile mode (full account):
+        pasu scan --profile PROFILE [--assume-role ROLE_ARN] [--format FORMAT] [--all]
+
+    Profile mode (targeted):
+        pasu scan --profile PROFILE --role NAME [--format FORMAT] [--all]
+        pasu scan --profile PROFILE --user NAME [--format FORMAT] [--all]
+
+    By default, full detail is shown only for Critical and High findings.
+    Pass ``--all`` to show full detail for every severity (Medium, Low included).
+    The summary line is always printed regardless of ``--all``.
     """
     use_machine = args.format != "text"
+    show_all: bool = getattr(args, "all", False)
     profile: str | None = getattr(args, "profile", None)
-    role_arn: str | None = getattr(args, "role", None)
+    assume_role_arn: str | None = getattr(args, "assume_role", None)
+    target_role: str | None = getattr(args, "target_role", None)
+    target_user: str | None = getattr(args, "target_user", None)
     file_arg: str | None = getattr(args, "file", None)
+
+    # --role and --user are mutually exclusive.
+    if target_role and target_user:
+        _handle_error(
+            "--role and --user are mutually exclusive. Provide one or the other.",
+            use_machine,
+        )
+        return
+
+    # --role and --user require --profile, not --file.
+    if (target_role or target_user) and file_arg:
+        _handle_error(
+            "--role and --user require --profile. They cannot be used with --file.",
+            use_machine,
+        )
+        return
+
+    if (target_role or target_user) and not profile:
+        _handle_error(
+            "--role and --user require --profile <profile_name>.",
+            use_machine,
+        )
+        return
 
     # Mutual exclusion: --file and --profile cannot be combined.
     if file_arg and profile:
@@ -627,13 +922,74 @@ def cmd_scan(args: argparse.Namespace) -> None:
         )
         return
 
+    _zero: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+
     # ── Profile mode ──────────────────────────────────────────────────────────
     if profile:
+        # ── Targeted single-resource mode (--role / --user) ───────────────────
+        if target_role or target_user:
+            from app.aws_collector import (
+                ResourceNotFoundError,
+                collect_targeted_policies,
+            )
+
+            resource_type = "role" if target_role else "user"
+            resource_name: str = target_role if target_role is not None else target_user  # type: ignore[assignment]
+
+            try:
+                policies = collect_targeted_policies(
+                    profile_name=profile,
+                    resource_type=resource_type,
+                    resource_name=resource_name,
+                )
+            except ResourceNotFoundError:
+                resource_label = resource_type.capitalize()
+                _handle_error(
+                    f"{resource_label} '{resource_name}' not found in profile '{profile}'",
+                    use_machine,
+                )
+                return
+            except RuntimeError as exc:
+                _handle_error(str(exc), use_machine)
+                return
+
+            if not policies:
+                if use_machine:
+                    print(
+                        json.dumps(
+                            {
+                                "policies": [],
+                                "status": "success",
+                                "message": (
+                                    f"No inline policies found on {resource_type} "
+                                    f"'{resource_name}'."
+                                ),
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(
+                        _color(
+                            f"No inline policies found on {resource_type} "
+                            f"'{resource_name}'.",
+                            _YELLOW,
+                        )
+                    )
+                return
+
+            # Re-use the same rendering path as full-account profile mode below,
+            # so pass the collected slice straight into the shared block.
+            _run_profile_scan(
+                policies, args, use_machine, show_all, _zero
+            )
+            return
+
         from app.aws_collector import collect_account_policies
 
         try:
             policies = collect_account_policies(
-                profile_name=profile, role_arn=role_arn
+                profile_name=profile, role_arn=assume_role_arn
             )
         except RuntimeError as exc:
             _handle_error(str(exc), use_machine)
@@ -641,33 +997,21 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
         if not policies:
             if use_machine:
-                print(json.dumps({"policies": [], "status": "success", "message": "No policies found."}, indent=2))
+                print(
+                    json.dumps(
+                        {
+                            "policies": [],
+                            "status": "success",
+                            "message": "No policies found.",
+                        },
+                        indent=2,
+                    )
+                )
             else:
                 print(_color("No IAM policies found in the account.", _YELLOW))
             return
 
-        if args.format == "json":
-            results: list[dict] = []
-            for policy in policies:
-                result = _run_scan_on_policy(
-                    policy.policy_json,
-                    policy.name,
-                    use_machine,
-                    args.format,
-                    policy_arn=policy.policy_arn,
-                )
-                if result is not None:
-                    results.append(result)
-            print(json.dumps({"policies": results, "status": "success"}, indent=2))
-        else:
-            for policy in policies:
-                _run_scan_on_policy(
-                    policy.policy_json,
-                    policy.name,
-                    use_machine,
-                    args.format,
-                    policy_arn=policy.policy_arn,
-                )
+        _run_profile_scan(policies, args, use_machine, show_all, _zero)
         return
 
     # ── File mode ─────────────────────────────────────────────────────────────
@@ -677,9 +1021,56 @@ def cmd_scan(args: argparse.Namespace) -> None:
         _handle_error(str(exc), use_machine)
         return
 
-    result = _run_scan_on_policy(policy_json, file_arg, use_machine, args.format)
-    if args.format == "json" and result is not None:
-        print(json.dumps(result, indent=2))
+    if args.format == "text":
+        # Buffer detail output so the summary line appears first.
+        import io as _io
+
+        buf = _io.StringIO()
+        old_stdout = sys.stdout
+        sys._real_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            _, counts = _run_scan_on_policy(
+                policy_json, file_arg, use_machine, args.format,
+                show_all=show_all,
+            )
+        finally:
+            sys.stdout = old_stdout
+            del sys._real_stdout
+        if counts is not None:
+            _print_scan_summary(1, counts)
+        sys.stdout.write(buf.getvalue())
+    elif args.format == "json":
+        json_result, counts = _run_scan_on_policy(
+            policy_json, file_arg, use_machine, args.format,
+            show_all=show_all,
+        )
+        if json_result is not None:
+            show_detail = json_result.pop("_show_detail", True)
+            summary_obj = {
+                "resources": 1,
+                "critical": (counts or _zero)["critical"],
+                "high": (counts or _zero)["high"],
+                "medium": (counts or _zero)["medium"],
+                "low": (counts or _zero)["low"],
+            }
+            if show_detail:
+                json_result["summary"] = summary_obj
+                print(json.dumps(json_result, indent=2))
+            else:
+                # Only emit the summary — no detail for Medium/Low policies
+                # when --all is not passed.
+                print(
+                    json.dumps(
+                        {"summary": summary_obj, "status": "success"},
+                        indent=2,
+                    )
+                )
+    else:
+        # sarif: print without a text summary (would corrupt the JSON stream)
+        _run_scan_on_policy(
+            policy_json, file_arg, use_machine, args.format, show_all=show_all
+        )
 
 
 # ── Fix formatters and handler ────────────────────────────────────────────────
@@ -838,8 +1229,12 @@ def cmd_fix(args: argparse.Namespace) -> None:
     result.fixed_risk_level = risk_score_label(fixed_score)
 
     if args.output:
+        # Canonicalize to resolve symlinks and remove any .. traversal
+        # components before writing.  In a future server-context use an
+        # additional allowlist directory check would be required here.
+        canonical_output = os.path.realpath(args.output)
         try:
-            with open(args.output, "w", encoding="utf-8") as fh:
+            with open(canonical_output, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(result.fixed_policy, indent=2))
         except OSError as exc:
             _handle_error(f"Cannot write output file: {exc}", use_machine)
@@ -920,21 +1315,56 @@ def main() -> None:
         "--profile",
         default=None,
         metavar="PROFILE",
+        type=_validate_cli_profile,
         help=(
             "AWS CLI profile name. When given, IAM policies are collected directly "
             "from the account and scanned in batch. Mutually exclusive with --file."
         ),
     )
     p_scan.add_argument(
-        "--role",
+        "--assume-role",
         default=None,
         metavar="ROLE_ARN",
+        dest="assume_role",
+        type=_validate_cli_role_arn,
         help=(
             "IAM role ARN to assume via STS before collecting policies. "
             "Only valid together with --profile (cross-account scanning)."
         ),
     )
+    p_scan.add_argument(
+        "--role",
+        default=None,
+        metavar="NAME",
+        dest="target_role",
+        type=_validate_cli_iam_name,
+        help=(
+            "Scan only the IAM role with this exact name. "
+            "Requires --profile; mutually exclusive with --user and --file."
+        ),
+    )
+    p_scan.add_argument(
+        "--user",
+        default=None,
+        metavar="NAME",
+        dest="target_user",
+        type=_validate_cli_iam_name,
+        help=(
+            "Scan only the IAM user with this exact name. "
+            "Requires --profile; mutually exclusive with --role and --file."
+        ),
+    )
     p_scan.add_argument("--format", **_format_kwargs)
+    p_scan.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        dest="all",
+        help=(
+            "Show full detail for all severities (Medium and Low included). "
+            "By default only Critical and High findings produce detail output."
+        ),
+    )
     p_scan.set_defaults(func=cmd_scan)
 
     # fix
